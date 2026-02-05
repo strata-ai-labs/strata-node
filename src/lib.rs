@@ -8,8 +8,9 @@ use napi_derive::napi;
 use std::collections::HashMap;
 
 use stratadb::{
+    BatchVectorEntry, BranchExportResult, BranchImportResult, BundleValidateResult,
     CollectionInfo, DistanceMetric, Error as StrataError, MergeStrategy,
-    Strata as RustStrata, Value, VersionedValue,
+    Strata as RustStrata, Value, VersionedBranchInfo, VersionedValue,
 };
 
 /// Convert a JavaScript value to a stratadb Value.
@@ -454,6 +455,57 @@ impl Strata {
         Ok(serde_json::Value::Array(arr))
     }
 
+    /// Get statistics for a single collection.
+    #[napi(js_name = "vectorCollectionStats")]
+    pub fn vector_collection_stats(&self, collection: String) -> napi::Result<serde_json::Value> {
+        let info = self
+            .inner
+            .vector_collection_stats(&collection)
+            .map_err(to_napi_err)?;
+        Ok(collection_info_to_js(info))
+    }
+
+    /// Batch insert/update multiple vectors.
+    ///
+    /// Each vector should be an object with 'key', 'vector', and optional 'metadata'.
+    #[napi(js_name = "vectorBatchUpsert")]
+    pub fn vector_batch_upsert(
+        &self,
+        collection: String,
+        vectors: Vec<serde_json::Value>,
+    ) -> napi::Result<Vec<u32>> {
+        let batch: Vec<BatchVectorEntry> = vectors
+            .into_iter()
+            .map(|v| {
+                let obj = v
+                    .as_object()
+                    .ok_or_else(|| napi::Error::from_reason("Expected object"))?;
+                let key = obj
+                    .get("key")
+                    .and_then(|k| k.as_str())
+                    .ok_or_else(|| napi::Error::from_reason("Missing 'key'"))?
+                    .to_string();
+                let vec: Vec<f32> = obj
+                    .get("vector")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| napi::Error::from_reason("Missing 'vector'"))?
+                    .iter()
+                    .map(|n| n.as_f64().unwrap_or(0.0) as f32)
+                    .collect();
+                let meta = obj.get("metadata").map(|m| js_to_value(m.clone()));
+                Ok(BatchVectorEntry {
+                    key,
+                    vector: vec,
+                    metadata: meta,
+                })
+            })
+            .collect::<napi::Result<_>>()?;
+        self.inner
+            .vector_batch_upsert(&collection, batch)
+            .map(|versions| versions.into_iter().map(|v| v as u32).collect())
+            .map_err(to_napi_err)
+    }
+
     // =========================================================================
     // Branch Management
     // =========================================================================
@@ -497,6 +549,23 @@ impl Strata {
     #[napi(js_name = "deleteBranch")]
     pub fn delete_branch(&self, branch: String) -> napi::Result<()> {
         self.inner.delete_branch(&branch).map_err(to_napi_err)
+    }
+
+    /// Check if a branch exists.
+    #[napi(js_name = "branchExists")]
+    pub fn branch_exists(&self, name: String) -> napi::Result<bool> {
+        self.inner.branches().exists(&name).map_err(to_napi_err)
+    }
+
+    /// Get branch metadata with version info.
+    ///
+    /// Returns an object with branch info, or null if the branch does not exist.
+    #[napi(js_name = "branchGet")]
+    pub fn branch_get(&self, name: String) -> napi::Result<serde_json::Value> {
+        match self.inner.branch_get(&name).map_err(to_napi_err)? {
+            Some(info) => Ok(versioned_branch_info_to_js(info)),
+            None => Ok(serde_json::Value::Null),
+        }
     }
 
     /// Compare two branches.
@@ -579,6 +648,12 @@ impl Strata {
         self.inner.delete_space(&space).map_err(to_napi_err)
     }
 
+    /// Force delete a space even if non-empty.
+    #[napi(js_name = "deleteSpaceForce")]
+    pub fn delete_space_force(&self, space: String) -> napi::Result<()> {
+        self.inner.delete_space_force(&space).map_err(to_napi_err)
+    }
+
     // =========================================================================
     // Database Operations
     // =========================================================================
@@ -612,6 +687,37 @@ impl Strata {
     pub fn compact(&self) -> napi::Result<()> {
         self.inner.compact().map_err(to_napi_err)
     }
+
+    // =========================================================================
+    // Bundle Operations
+    // =========================================================================
+
+    /// Export a branch to a bundle file.
+    #[napi(js_name = "branchExport")]
+    pub fn branch_export(&self, branch: String, path: String) -> napi::Result<serde_json::Value> {
+        let result = self
+            .inner
+            .branch_export(&branch, &path)
+            .map_err(to_napi_err)?;
+        Ok(branch_export_result_to_js(result))
+    }
+
+    /// Import a branch from a bundle file.
+    #[napi(js_name = "branchImport")]
+    pub fn branch_import(&self, path: String) -> napi::Result<serde_json::Value> {
+        let result = self.inner.branch_import(&path).map_err(to_napi_err)?;
+        Ok(branch_import_result_to_js(result))
+    }
+
+    /// Validate a bundle file without importing.
+    #[napi(js_name = "branchValidateBundle")]
+    pub fn branch_validate_bundle(&self, path: String) -> napi::Result<serde_json::Value> {
+        let result = self
+            .inner
+            .branch_validate_bundle(&path)
+            .map_err(to_napi_err)?;
+        Ok(bundle_validate_result_to_js(result))
+    }
 }
 
 /// Convert CollectionInfo to JSON.
@@ -623,5 +729,47 @@ fn collection_info_to_js(c: CollectionInfo) -> serde_json::Value {
         "count": c.count,
         "indexType": c.index_type,
         "memoryBytes": c.memory_bytes,
+    })
+}
+
+/// Convert VersionedBranchInfo to JSON.
+fn versioned_branch_info_to_js(info: VersionedBranchInfo) -> serde_json::Value {
+    serde_json::json!({
+        "id": info.info.id.as_str(),
+        "status": format!("{:?}", info.info.status).to_lowercase(),
+        "createdAt": info.info.created_at,
+        "updatedAt": info.info.updated_at,
+        "parentId": info.info.parent_id.map(|p| p.as_str().to_string()),
+        "version": info.version,
+        "timestamp": info.timestamp,
+    })
+}
+
+/// Convert BranchExportResult to JSON.
+fn branch_export_result_to_js(r: BranchExportResult) -> serde_json::Value {
+    serde_json::json!({
+        "branchId": r.branch_id,
+        "path": r.path,
+        "entryCount": r.entry_count,
+        "bundleSize": r.bundle_size,
+    })
+}
+
+/// Convert BranchImportResult to JSON.
+fn branch_import_result_to_js(r: BranchImportResult) -> serde_json::Value {
+    serde_json::json!({
+        "branchId": r.branch_id,
+        "transactionsApplied": r.transactions_applied,
+        "keysWritten": r.keys_written,
+    })
+}
+
+/// Convert BundleValidateResult to JSON.
+fn bundle_validate_result_to_js(r: BundleValidateResult) -> serde_json::Value {
+    serde_json::json!({
+        "branchId": r.branch_id,
+        "formatVersion": r.format_version,
+        "entryCount": r.entry_count,
+        "checksumsValid": r.checksums_valid,
     })
 }

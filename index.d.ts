@@ -92,6 +92,47 @@ export interface DatabaseInfo {
   totalKeys: number;
 }
 
+/** Branch metadata with version info */
+export interface BranchInfo {
+  id: string;
+  status: string;
+  createdAt: number;
+  updatedAt: number;
+  parentId?: string;
+  version: number;
+  timestamp: number;
+}
+
+/** Branch export result */
+export interface BranchExportResult {
+  branchId: string;
+  path: string;
+  entryCount: number;
+  bundleSize: number;
+}
+
+/** Branch import result */
+export interface BranchImportResult {
+  branchId: string;
+  transactionsApplied: number;
+  keysWritten: number;
+}
+
+/** Bundle validation result */
+export interface BundleValidateResult {
+  branchId: string;
+  formatVersion: number;
+  entryCount: number;
+  checksumsValid: boolean;
+}
+
+/** Vector entry for batch upsert */
+export interface BatchVectorEntry {
+  key: string;
+  vector: number[];
+  metadata?: JsonValue;
+}
+
 /**
  * StrataDB database handle.
  *
@@ -330,6 +371,21 @@ export class Strata {
    */
   vectorSearch(collection: string, query: number[], k: number): SearchMatch[];
 
+  /**
+   * Get statistics for a single collection.
+   * @param collection - Collection name
+   * @returns Collection information
+   */
+  vectorCollectionStats(collection: string): CollectionInfo;
+
+  /**
+   * Batch insert/update multiple vectors.
+   * @param collection - Collection name
+   * @param vectors - Array of vector entries
+   * @returns Array of version numbers
+   */
+  vectorBatchUpsert(collection: string, vectors: BatchVectorEntry[]): number[];
+
   // =========================================================================
   // Branch Management
   // =========================================================================
@@ -367,6 +423,20 @@ export class Strata {
    * @param branch - Branch name
    */
   deleteBranch(branch: string): void;
+
+  /**
+   * Check if a branch exists.
+   * @param name - Branch name
+   * @returns True if the branch exists
+   */
+  branchExists(name: string): boolean;
+
+  /**
+   * Get branch metadata with version info.
+   * @param name - Branch name
+   * @returns Branch info, or null if not found
+   */
+  branchGet(name: string): BranchInfo | null;
 
   /**
    * Compare two branches.
@@ -408,6 +478,12 @@ export class Strata {
    */
   deleteSpace(space: string): void;
 
+  /**
+   * Force delete a space even if non-empty.
+   * @param space - Space name
+   */
+  deleteSpaceForce(space: string): void;
+
   // =========================================================================
   // Database Operations
   // =========================================================================
@@ -431,4 +507,30 @@ export class Strata {
    * Trigger compaction.
    */
   compact(): void;
+
+  // =========================================================================
+  // Bundle Operations
+  // =========================================================================
+
+  /**
+   * Export a branch to a bundle file.
+   * @param branch - Branch name
+   * @param path - Output file path
+   * @returns Export result with counts
+   */
+  branchExport(branch: string, path: string): BranchExportResult;
+
+  /**
+   * Import a branch from a bundle file.
+   * @param path - Bundle file path
+   * @returns Import result with counts
+   */
+  branchImport(path: string): BranchImportResult;
+
+  /**
+   * Validate a bundle file without importing.
+   * @param path - Bundle file path
+   * @returns Validation result
+   */
+  branchValidateBundle(path: string): BundleValidateResult;
 }

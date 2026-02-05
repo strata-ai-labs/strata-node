@@ -180,6 +180,8 @@ if (newVersion === null) {
 | `vectorGet(collection, key)` | Get vector |
 | `vectorDelete(collection, key)` | Delete vector |
 | `vectorSearch(collection, query, k)` | Search |
+| `vectorCollectionStats(collection)` | Get collection statistics |
+| `vectorBatchUpsert(collection, vectors)` | Batch insert/update vectors |
 
 ### Branches
 
@@ -191,6 +193,8 @@ if (newVersion === null) {
 | `forkBranch(dest)` | Fork with data copy |
 | `listBranches()` | List all branches |
 | `deleteBranch(name)` | Delete branch |
+| `branchExists(name)` | Check if branch exists |
+| `branchGet(name)` | Get branch metadata |
 | `diffBranches(a, b)` | Compare branches |
 | `mergeBranches(source, strategy?)` | Merge into current |
 
@@ -202,6 +206,7 @@ if (newVersion === null) {
 | `setSpace(name)` | Switch space |
 | `listSpaces()` | List spaces |
 | `deleteSpace(name)` | Delete space |
+| `deleteSpaceForce(name)` | Force delete space |
 
 ### Database
 
@@ -211,6 +216,14 @@ if (newVersion === null) {
 | `info()` | Get database info |
 | `flush()` | Flush to disk |
 | `compact()` | Trigger compaction |
+
+### Bundle Operations
+
+| Method | Description |
+|--------|-------------|
+| `branchExport(branch, path)` | Export branch to bundle file |
+| `branchImport(path)` | Import branch from bundle file |
+| `branchValidateBundle(path)` | Validate bundle file |
 
 ## TypeScript
 
