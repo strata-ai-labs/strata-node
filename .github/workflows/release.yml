@@ -91,10 +91,15 @@ jobs:
 
       - name: Setup npm auth
         run: |
-          echo "//registry.npmjs.org/:_authToken=${{ secrets.NPM_TOKEN }}" > ~/.npmrc
-          echo "Token length: $(echo -n "${{ secrets.NPM_TOKEN }}" | wc -c)"
-          cat ~/.npmrc | head -c 50
-          echo "..."
+          echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
+          echo "Token length: ${#NODE_AUTH_TOKEN}"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Verify npm auth
+        run: npm whoami
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish platform packages
         run: |
@@ -103,10 +108,13 @@ jobs:
               echo "Publishing $dir"
               cd "$dir"
               npm publish --access public
-              cd ../..
+              cd -
             fi
           done
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish main package
-        run: |
-          npm publish --access public
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
