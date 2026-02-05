@@ -151,14 +151,14 @@ impl Strata {
     // =========================================================================
 
     /// Store a key-value pair.
-    #[napi]
+    #[napi(js_name = "kvPut")]
     pub fn kv_put(&self, key: String, value: serde_json::Value) -> napi::Result<u32> {
         let v = js_to_value(value);
         self.inner.kv_put(&key, v).map(|n| n as u32).map_err(to_napi_err)
     }
 
     /// Get a value by key.
-    #[napi]
+    #[napi(js_name = "kvGet")]
     pub fn kv_get(&self, key: String) -> napi::Result<serde_json::Value> {
         match self.inner.kv_get(&key).map_err(to_napi_err)? {
             Some(v) => Ok(value_to_js(v)),
@@ -167,19 +167,19 @@ impl Strata {
     }
 
     /// Delete a key.
-    #[napi]
+    #[napi(js_name = "kvDelete")]
     pub fn kv_delete(&self, key: String) -> napi::Result<bool> {
         self.inner.kv_delete(&key).map_err(to_napi_err)
     }
 
     /// List keys with optional prefix filter.
-    #[napi]
+    #[napi(js_name = "kvList")]
     pub fn kv_list(&self, prefix: Option<String>) -> napi::Result<Vec<String>> {
         self.inner.kv_list(prefix.as_deref()).map_err(to_napi_err)
     }
 
     /// Get version history for a key.
-    #[napi]
+    #[napi(js_name = "kvHistory")]
     pub fn kv_history(&self, key: String) -> napi::Result<serde_json::Value> {
         match self.inner.kv_getv(&key).map_err(to_napi_err)? {
             Some(versions) => {
@@ -198,14 +198,14 @@ impl Strata {
     // =========================================================================
 
     /// Set a state cell value.
-    #[napi]
+    #[napi(js_name = "stateSet")]
     pub fn state_set(&self, cell: String, value: serde_json::Value) -> napi::Result<u32> {
         let v = js_to_value(value);
         self.inner.state_set(&cell, v).map(|n| n as u32).map_err(to_napi_err)
     }
 
     /// Get a state cell value.
-    #[napi]
+    #[napi(js_name = "stateGet")]
     pub fn state_get(&self, cell: String) -> napi::Result<serde_json::Value> {
         match self.inner.state_get(&cell).map_err(to_napi_err)? {
             Some(v) => Ok(value_to_js(v)),
@@ -214,14 +214,14 @@ impl Strata {
     }
 
     /// Initialize a state cell if it doesn't exist.
-    #[napi]
+    #[napi(js_name = "stateInit")]
     pub fn state_init(&self, cell: String, value: serde_json::Value) -> napi::Result<u32> {
         let v = js_to_value(value);
         self.inner.state_init(&cell, v).map(|n| n as u32).map_err(to_napi_err)
     }
 
     /// Compare-and-swap update based on version.
-    #[napi]
+    #[napi(js_name = "stateCas")]
     pub fn state_cas(
         &self,
         cell: String,
@@ -241,14 +241,14 @@ impl Strata {
     // =========================================================================
 
     /// Append an event to the log.
-    #[napi]
+    #[napi(js_name = "eventAppend")]
     pub fn event_append(&self, event_type: String, payload: serde_json::Value) -> napi::Result<u32> {
         let v = js_to_value(payload);
         self.inner.event_append(&event_type, v).map(|n| n as u32).map_err(to_napi_err)
     }
 
     /// Get an event by sequence number.
-    #[napi]
+    #[napi(js_name = "eventGet")]
     pub fn event_get(&self, sequence: u32) -> napi::Result<serde_json::Value> {
         match self.inner.event_get(sequence as u64).map_err(to_napi_err)? {
             Some(vv) => Ok(versioned_to_js(vv)),
@@ -257,7 +257,7 @@ impl Strata {
     }
 
     /// List events by type.
-    #[napi]
+    #[napi(js_name = "eventList")]
     pub fn event_list(&self, event_type: String) -> napi::Result<serde_json::Value> {
         let events = self.inner.event_get_by_type(&event_type).map_err(to_napi_err)?;
         let arr: Vec<serde_json::Value> = events.into_iter().map(versioned_to_js).collect();
@@ -265,7 +265,7 @@ impl Strata {
     }
 
     /// Get total event count.
-    #[napi]
+    #[napi(js_name = "eventLen")]
     pub fn event_len(&self) -> napi::Result<u32> {
         self.inner.event_len().map(|n| n as u32).map_err(to_napi_err)
     }
@@ -275,14 +275,14 @@ impl Strata {
     // =========================================================================
 
     /// Set a value at a JSONPath.
-    #[napi]
+    #[napi(js_name = "jsonSet")]
     pub fn json_set(&self, key: String, path: String, value: serde_json::Value) -> napi::Result<u32> {
         let v = js_to_value(value);
         self.inner.json_set(&key, &path, v).map(|n| n as u32).map_err(to_napi_err)
     }
 
     /// Get a value at a JSONPath.
-    #[napi]
+    #[napi(js_name = "jsonGet")]
     pub fn json_get(&self, key: String, path: String) -> napi::Result<serde_json::Value> {
         match self.inner.json_get(&key, &path).map_err(to_napi_err)? {
             Some(v) => Ok(value_to_js(v)),
@@ -291,13 +291,13 @@ impl Strata {
     }
 
     /// Delete a JSON document.
-    #[napi]
+    #[napi(js_name = "jsonDelete")]
     pub fn json_delete(&self, key: String, path: String) -> napi::Result<u32> {
         self.inner.json_delete(&key, &path).map(|n| n as u32).map_err(to_napi_err)
     }
 
     /// List JSON document keys.
-    #[napi]
+    #[napi(js_name = "jsonList")]
     pub fn json_list(
         &self,
         limit: u32,
@@ -319,7 +319,7 @@ impl Strata {
     // =========================================================================
 
     /// Create a vector collection.
-    #[napi]
+    #[napi(js_name = "vectorCreateCollection")]
     pub fn vector_create_collection(
         &self,
         collection: String,
@@ -339,7 +339,7 @@ impl Strata {
     }
 
     /// Delete a vector collection.
-    #[napi]
+    #[napi(js_name = "vectorDeleteCollection")]
     pub fn vector_delete_collection(&self, collection: String) -> napi::Result<bool> {
         self.inner
             .vector_delete_collection(&collection)
@@ -347,7 +347,7 @@ impl Strata {
     }
 
     /// List vector collections.
-    #[napi]
+    #[napi(js_name = "vectorListCollections")]
     pub fn vector_list_collections(&self) -> napi::Result<serde_json::Value> {
         let collections = self.inner.vector_list_collections().map_err(to_napi_err)?;
         let arr: Vec<serde_json::Value> = collections
@@ -358,7 +358,7 @@ impl Strata {
     }
 
     /// Insert or update a vector.
-    #[napi]
+    #[napi(js_name = "vectorUpsert")]
     pub fn vector_upsert(
         &self,
         collection: String,
@@ -375,7 +375,7 @@ impl Strata {
     }
 
     /// Get a vector by key.
-    #[napi]
+    #[napi(js_name = "vectorGet")]
     pub fn vector_get(&self, collection: String, key: String) -> napi::Result<serde_json::Value> {
         match self.inner.vector_get(&collection, &key).map_err(to_napi_err)? {
             Some(vd) => {
@@ -393,13 +393,13 @@ impl Strata {
     }
 
     /// Delete a vector.
-    #[napi]
+    #[napi(js_name = "vectorDelete")]
     pub fn vector_delete(&self, collection: String, key: String) -> napi::Result<bool> {
         self.inner.vector_delete(&collection, &key).map_err(to_napi_err)
     }
 
     /// Search for similar vectors.
-    #[napi]
+    #[napi(js_name = "vectorSearch")]
     pub fn vector_search(
         &self,
         collection: String,
@@ -429,25 +429,25 @@ impl Strata {
     // =========================================================================
 
     /// Get the current branch name.
-    #[napi]
+    #[napi(js_name = "currentBranch")]
     pub fn current_branch(&self) -> String {
         self.inner.current_branch().to_string()
     }
 
     /// Switch to a different branch.
-    #[napi]
+    #[napi(js_name = "setBranch")]
     pub fn set_branch(&mut self, branch: String) -> napi::Result<()> {
         self.inner.set_branch(&branch).map_err(to_napi_err)
     }
 
     /// Create a new empty branch.
-    #[napi]
+    #[napi(js_name = "createBranch")]
     pub fn create_branch(&self, branch: String) -> napi::Result<()> {
         self.inner.create_branch(&branch).map_err(to_napi_err)
     }
 
     /// Fork the current branch to a new branch, copying all data.
-    #[napi]
+    #[napi(js_name = "forkBranch")]
     pub fn fork_branch(&self, destination: String) -> napi::Result<serde_json::Value> {
         let info = self.inner.fork_branch(&destination).map_err(to_napi_err)?;
         Ok(serde_json::json!({
@@ -458,19 +458,19 @@ impl Strata {
     }
 
     /// List all branches.
-    #[napi]
+    #[napi(js_name = "listBranches")]
     pub fn list_branches(&self) -> napi::Result<Vec<String>> {
         self.inner.list_branches().map_err(to_napi_err)
     }
 
     /// Delete a branch.
-    #[napi]
+    #[napi(js_name = "deleteBranch")]
     pub fn delete_branch(&self, branch: String) -> napi::Result<()> {
         self.inner.delete_branch(&branch).map_err(to_napi_err)
     }
 
     /// Compare two branches.
-    #[napi]
+    #[napi(js_name = "diffBranches")]
     pub fn diff_branches(&self, branch_a: String, branch_b: String) -> napi::Result<serde_json::Value> {
         let diff = self
             .inner
@@ -488,7 +488,7 @@ impl Strata {
     }
 
     /// Merge a branch into the current branch.
-    #[napi]
+    #[napi(js_name = "mergeBranches")]
     pub fn merge_branches(
         &self,
         source: String,
@@ -526,25 +526,25 @@ impl Strata {
     // =========================================================================
 
     /// Get the current space name.
-    #[napi]
+    #[napi(js_name = "currentSpace")]
     pub fn current_space(&self) -> String {
         self.inner.current_space().to_string()
     }
 
     /// Switch to a different space.
-    #[napi]
+    #[napi(js_name = "setSpace")]
     pub fn set_space(&mut self, space: String) -> napi::Result<()> {
         self.inner.set_space(&space).map_err(to_napi_err)
     }
 
     /// List all spaces in the current branch.
-    #[napi]
+    #[napi(js_name = "listSpaces")]
     pub fn list_spaces(&self) -> napi::Result<Vec<String>> {
         self.inner.list_spaces().map_err(to_napi_err)
     }
 
     /// Delete a space and all its data.
-    #[napi]
+    #[napi(js_name = "deleteSpace")]
     pub fn delete_space(&self, space: String) -> napi::Result<()> {
         self.inner.delete_space(&space).map_err(to_napi_err)
     }
