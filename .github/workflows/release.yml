@@ -88,6 +88,8 @@ jobs:
 
       - name: Prepare npm packages
         run: npm run prepublishOnly
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: List packages
         run: ls -R npm || true
