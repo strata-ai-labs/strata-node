@@ -231,6 +231,7 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { Strata } = nativeBinding
+const { Strata, setup } = nativeBinding
 
 module.exports.Strata = Strata
+module.exports.setup = setup
