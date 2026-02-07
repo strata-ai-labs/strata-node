@@ -190,6 +190,30 @@ impl Strata {
         })
     }
 
+    /// Download model files for auto-embedding.
+    ///
+    /// Downloads MiniLM-L6-v2 model files to ~/.stratadb/models/minilm-l6-v2/.
+    /// Called automatically when autoEmbed is true, but can be called explicitly
+    /// to pre-download (e.g., during npm install).
+    ///
+    /// Returns the path where model files are stored.
+    #[napi]
+    pub fn setup() -> napi::Result<String> {
+        #[cfg(feature = "embed")]
+        {
+            let path = strata_intelligence::embed::download::ensure_model()
+                .map_err(|e| napi::Error::from_reason(e))?;
+            Ok(path.to_string_lossy().into_owned())
+        }
+
+        #[cfg(not(feature = "embed"))]
+        {
+            Err(napi::Error::from_reason(
+                "The 'embed' feature is not enabled in this build",
+            ))
+        }
+    }
+
     // =========================================================================
     // KV Store
     // =========================================================================

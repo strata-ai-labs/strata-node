@@ -187,6 +187,18 @@ export class Strata {
    */
   static cache(): Strata;
 
+  /**
+   * Download model files for auto-embedding.
+   *
+   * Downloads MiniLM-L6-v2 model files to ~/.stratadb/models/minilm-l6-v2/.
+   * Called automatically when autoEmbed is true, but can be called explicitly
+   * to pre-download (e.g., during npm install).
+   *
+   * @returns The path where model files are stored.
+   * @throws Error if the download fails or embed feature is not enabled.
+   */
+  static setup(): string;
+
   // =========================================================================
   // KV Store
   // =========================================================================
