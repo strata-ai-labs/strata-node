@@ -1,15 +1,13 @@
 # strata-node
 
-Node.js SDK for [StrataDB](https://github.com/strata-systems/strata-core) - an embedded database for AI agents.
+Node.js SDK for [StrataDB](https://github.com/strata-systems/strata-core) — an embedded database for AI agents.
 
 NAPI-RS bindings embedding the Rust library directly in a native Node.js addon. No network hop, no serialization overhead beyond the Node/Rust boundary.
 
 ## Installation
 
-### From npm (coming soon)
-
 ```bash
-npm install stratadb
+npm install @stratadb/core
 ```
 
 ### From Source
@@ -25,24 +23,26 @@ npm run build
 
 ## Quick Start
 
+All data methods are **async** and return Promises. Use `await` for every call.
+
 ```javascript
-const { Strata } = require('stratadb');
+const { Strata } = require('@stratadb/core');
 
 // Open a database (or use Strata.cache() for in-memory)
 const db = Strata.open('/path/to/data');
 
 // Key-value storage
-db.kvPut('user:123', 'Alice');
-console.log(db.kvGet('user:123'));  // "Alice"
+await db.kvPut('user:123', 'Alice');
+console.log(await db.kvGet('user:123'));  // "Alice"
 
 // Branch isolation (like git branches)
-db.createBranch('experiment');
-db.setBranch('experiment');
-console.log(db.kvGet('user:123'));  // null - isolated
+await db.createBranch('experiment');
+await db.setBranch('experiment');
+console.log(await db.kvGet('user:123'));  // null - isolated
 
 // Space organization within branches
-db.setSpace('conversations');
-db.kvPut('msg_001', 'hello');
+await db.setSpace('conversations');
+await db.kvPut('msg_001', 'hello');
 ```
 
 ## Features
@@ -58,18 +58,50 @@ db.kvPut('msg_001', 'hello');
 | **Vector Store** | Embeddings, similarity search | `vectorUpsert`, `vectorSearch` |
 | **Branch** | Data isolation | `createBranch`, `setBranch`, `forkBranch` |
 
+### Error Handling
+
+All errors thrown by StrataDB are instances of `StrataError` (or a subclass). Each error has a `.code` property for programmatic handling:
+
+```javascript
+const { Strata, NotFoundError, StrataError } = require('@stratadb/core');
+
+const db = Strata.cache();
+
+try {
+  await db.vectorSearch('missing_collection', [1, 0, 0], 1);
+} catch (err) {
+  if (err instanceof NotFoundError) {
+    console.log('Collection not found');
+  }
+  // Or check the code property:
+  console.log(err.code); // "NOT_FOUND"
+}
+```
+
+Error class hierarchy:
+
+| Error Class | Code | When |
+|---|---|---|
+| `NotFoundError` | `NOT_FOUND` | Key, branch, collection, or document not found |
+| `ValidationError` | `VALIDATION` | Invalid key, path, input, or wrong type |
+| `ConflictError` | `CONFLICT` | Version conflict, transition failed, transaction conflict |
+| `StateError` | `STATE` | Branch closed/exists, collection exists, transaction not active |
+| `ConstraintError` | `CONSTRAINT` | Dimension mismatch, constraint violation, overflow |
+| `AccessDeniedError` | `ACCESS_DENIED` | Insufficient permissions |
+| `IoError` | `IO` | I/O, serialization, internal, or not-implemented errors |
+
 ### Vector Operations
 
 ```javascript
 // Create a collection
-db.vectorCreateCollection('embeddings', 384, 'cosine');
+await db.vectorCreateCollection('embeddings', 384, 'cosine');
 
 // Upsert with array
 const embedding = new Array(384).fill(0).map(() => Math.random());
-db.vectorUpsert('embeddings', 'doc-1', embedding, { title: 'Hello' });
+await db.vectorUpsert('embeddings', 'doc-1', embedding, { title: 'Hello' });
 
 // Search returns matches with scores
-const results = db.vectorSearch('embeddings', embedding, 10);
+const results = await db.vectorSearch('embeddings', embedding, 10);
 for (const match of results) {
   console.log(`${match.key}: ${match.score}`);
 }
@@ -79,162 +111,232 @@ for (const match of results) {
 
 ```javascript
 // Fork current branch (copies all data)
-db.forkBranch('experiment');
+await db.forkBranch('experiment');
 
 // Compare branches
-const diff = db.diffBranches('default', 'experiment');
+const diff = await db.diffBranches('default', 'experiment');
 console.log(`Added: ${diff.summary.totalAdded}`);
 
 // Merge branches
-const result = db.mergeBranches('experiment', 'last_writer_wins');
+const result = await db.mergeBranches('experiment', 'last_writer_wins');
 console.log(`Keys applied: ${result.keysApplied}`);
+```
+
+### Transactions
+
+```javascript
+await db.begin();
+try {
+  await db.kvPut('key1', 'value1');
+  await db.kvPut('key2', 'value2');
+  const version = await db.commit();
+  console.log(`Committed at version ${version}`);
+} catch (err) {
+  await db.rollback();
+  throw err;
+}
+
+// Check transaction state
+console.log(await db.txnIsActive()); // false
+const info = await db.txnInfo();     // null when no txn
 ```
 
 ### Event Log
 
 ```javascript
 // Append events
-db.eventAppend('tool_call', { tool: 'search', query: 'weather' });
-db.eventAppend('tool_call', { tool: 'calculator', expr: '2+2' });
+await db.eventAppend('tool_call', { tool: 'search', query: 'weather' });
+await db.eventAppend('tool_call', { tool: 'calculator', expr: '2+2' });
 
 // Get by sequence number
-const event = db.eventGet(0);
+const event = await db.eventGet(0);
 
 // List by type
-const toolCalls = db.eventList('tool_call');
+const toolCalls = await db.eventList('tool_call');
 ```
 
 ### Compare-and-Swap (Version-based)
 
 ```javascript
 // Initialize if not exists
-db.stateInit('counter', 0);
+await db.stateInit('counter', 0);
 
-// CAS is version-based - pass expected version, not expected value
-// Get current value and its version via stateSet (returns version)
-const version = db.stateSet('counter', 1);
+// CAS is version-based — pass expected version, not expected value
+const version = await db.stateSet('counter', 1);
 
 // Update only if version matches
-const newVersion = db.stateCas('counter', 2, version);  // (cell, new_value, expected_version)
+const newVersion = await db.stateCas('counter', 2, version);
 if (newVersion === null) {
-  console.log('CAS failed - version mismatch');
+  console.log('CAS failed — version mismatch');
 }
+```
+
+### Cross-Primitive Search
+
+```javascript
+// Search across all primitives (KV, events, JSON docs, etc.)
+const hits = await db.search('hello world');
+for (const hit of hits) {
+  console.log(`${hit.primitive}/${hit.entity}: score=${hit.score}`);
+}
+
+// Search specific primitives only
+const kvHits = await db.search('hello', 10, ['kv']);
+```
+
+### Retention
+
+```javascript
+// Trigger garbage collection to reclaim old versions
+await db.retentionApply();
 ```
 
 ## API Reference
 
 ### Strata
 
-| Method | Description |
-|--------|-------------|
-| `Strata.open(path)` | Open database at path |
-| `Strata.cache()` | Create in-memory database |
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `Strata.open(path, options?)` | `Strata` | Open database at path (sync) |
+| `Strata.cache()` | `Strata` | Create in-memory database (sync) |
 
 ### KV Store
 
-| Method | Description |
-|--------|-------------|
-| `kvPut(key, value)` | Store a value |
-| `kvGet(key)` | Get a value (returns null if missing) |
-| `kvDelete(key)` | Delete a key |
-| `kvList(prefix?)` | List keys |
-| `kvHistory(key)` | Get version history |
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `kvPut(key, value)` | `Promise<number>` | Store a value, returns version |
+| `kvGet(key)` | `Promise<JsonValue>` | Get a value (null if missing) |
+| `kvDelete(key)` | `Promise<boolean>` | Delete a key |
+| `kvList(prefix?)` | `Promise<string[]>` | List keys |
+| `kvHistory(key)` | `Promise<VersionedValue[]>` | Get version history |
+| `kvGetVersioned(key)` | `Promise<VersionedValue>` | Get value with version info |
+| `kvListPaginated(prefix?, limit?)` | `Promise<KvListResult>` | List keys with limit |
 
 ### State Cell
 
-| Method | Description |
-|--------|-------------|
-| `stateSet(cell, value)` | Set value |
-| `stateGet(cell)` | Get value |
-| `stateInit(cell, value)` | Initialize if not exists |
-| `stateCas(cell, newValue, expectedVersion?)` | Compare-and-swap (version-based) |
-| `stateHistory(cell)` | Get version history |
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `stateSet(cell, value)` | `Promise<number>` | Set value, returns version |
+| `stateGet(cell)` | `Promise<JsonValue>` | Get value |
+| `stateInit(cell, value)` | `Promise<number>` | Initialize if not exists |
+| `stateCas(cell, newValue, expectedVersion?)` | `Promise<number\|null>` | Compare-and-swap |
+| `stateHistory(cell)` | `Promise<VersionedValue[]>` | Get version history |
+| `stateDelete(cell)` | `Promise<boolean>` | Delete a state cell |
+| `stateList(prefix?)` | `Promise<string[]>` | List cell names |
+| `stateGetVersioned(cell)` | `Promise<VersionedValue>` | Get with version info |
 
 ### Event Log
 
-| Method | Description |
-|--------|-------------|
-| `eventAppend(type, payload)` | Append event |
-| `eventGet(sequence)` | Get by sequence |
-| `eventList(type)` | List by type |
-| `eventLen()` | Get count |
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `eventAppend(type, payload)` | `Promise<number>` | Append event, returns sequence |
+| `eventGet(sequence)` | `Promise<VersionedValue>` | Get by sequence number |
+| `eventList(type)` | `Promise<VersionedValue[]>` | List by type |
+| `eventLen()` | `Promise<number>` | Get total count |
+| `eventListPaginated(type, limit?, after?)` | `Promise<VersionedValue[]>` | List with pagination |
 
 ### JSON Store
 
-| Method | Description |
-|--------|-------------|
-| `jsonSet(key, path, value)` | Set at JSONPath |
-| `jsonGet(key, path)` | Get at JSONPath |
-| `jsonDelete(key, path)` | Delete |
-| `jsonHistory(key)` | Get version history |
-| `jsonList(limit, prefix?, cursor?)` | List keys |
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `jsonSet(key, path, value)` | `Promise<number>` | Set at JSONPath |
+| `jsonGet(key, path)` | `Promise<JsonValue>` | Get at JSONPath |
+| `jsonDelete(key, path)` | `Promise<number>` | Delete |
+| `jsonHistory(key)` | `Promise<VersionedValue[]>` | Get version history |
+| `jsonList(limit, prefix?, cursor?)` | `Promise<JsonListResult>` | List keys |
+| `jsonGetVersioned(key)` | `Promise<VersionedValue>` | Get with version info |
 
 ### Vector Store
 
-| Method | Description |
-|--------|-------------|
-| `vectorCreateCollection(name, dim, metric?)` | Create collection |
-| `vectorDeleteCollection(name)` | Delete collection |
-| `vectorListCollections()` | List collections |
-| `vectorUpsert(collection, key, vector, metadata?)` | Insert/update |
-| `vectorGet(collection, key)` | Get vector |
-| `vectorDelete(collection, key)` | Delete vector |
-| `vectorSearch(collection, query, k)` | Search |
-| `vectorCollectionStats(collection)` | Get collection statistics |
-| `vectorBatchUpsert(collection, vectors)` | Batch insert/update vectors |
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `vectorCreateCollection(name, dim, metric?)` | `Promise<number>` | Create collection |
+| `vectorDeleteCollection(name)` | `Promise<boolean>` | Delete collection |
+| `vectorListCollections()` | `Promise<CollectionInfo[]>` | List collections |
+| `vectorUpsert(collection, key, vector, metadata?)` | `Promise<number>` | Insert/update |
+| `vectorGet(collection, key)` | `Promise<VectorData>` | Get vector |
+| `vectorDelete(collection, key)` | `Promise<boolean>` | Delete vector |
+| `vectorSearch(collection, query, k)` | `Promise<SearchMatch[]>` | Search |
+| `vectorCollectionStats(collection)` | `Promise<CollectionInfo>` | Get stats |
+| `vectorBatchUpsert(collection, vectors)` | `Promise<number[]>` | Batch insert/update |
+| `vectorSearchFiltered(collection, query, k, metric?, filter?)` | `Promise<SearchMatch[]>` | Filtered search |
 
 ### Branches
 
-| Method | Description |
-|--------|-------------|
-| `currentBranch()` | Get current branch |
-| `setBranch(name)` | Switch branch |
-| `createBranch(name)` | Create empty branch |
-| `forkBranch(dest)` | Fork with data copy |
-| `listBranches()` | List all branches |
-| `deleteBranch(name)` | Delete branch |
-| `branchExists(name)` | Check if branch exists |
-| `branchGet(name)` | Get branch metadata |
-| `diffBranches(a, b)` | Compare branches |
-| `mergeBranches(source, strategy?)` | Merge into current |
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `currentBranch()` | `Promise<string>` | Get current branch |
+| `setBranch(name)` | `Promise<void>` | Switch branch |
+| `createBranch(name)` | `Promise<void>` | Create empty branch |
+| `forkBranch(dest)` | `Promise<ForkResult>` | Fork with data copy |
+| `listBranches()` | `Promise<string[]>` | List all branches |
+| `deleteBranch(name)` | `Promise<void>` | Delete branch |
+| `branchExists(name)` | `Promise<boolean>` | Check if branch exists |
+| `branchGet(name)` | `Promise<BranchInfo>` | Get branch metadata |
+| `diffBranches(a, b)` | `Promise<DiffResult>` | Compare branches |
+| `mergeBranches(source, strategy?)` | `Promise<MergeResult>` | Merge into current |
 
 ### Spaces
 
-| Method | Description |
-|--------|-------------|
-| `currentSpace()` | Get current space |
-| `setSpace(name)` | Switch space |
-| `listSpaces()` | List spaces |
-| `deleteSpace(name)` | Delete space |
-| `deleteSpaceForce(name)` | Force delete space |
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `currentSpace()` | `Promise<string>` | Get current space |
+| `setSpace(name)` | `Promise<void>` | Switch space |
+| `listSpaces()` | `Promise<string[]>` | List spaces |
+| `deleteSpace(name)` | `Promise<void>` | Delete space |
+| `deleteSpaceForce(name)` | `Promise<void>` | Force delete space |
+| `spaceCreate(name)` | `Promise<void>` | Create space explicitly |
+| `spaceExists(name)` | `Promise<boolean>` | Check if space exists |
 
 ### Database
 
-| Method | Description |
-|--------|-------------|
-| `ping()` | Health check |
-| `info()` | Get database info |
-| `flush()` | Flush to disk |
-| `compact()` | Trigger compaction |
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `ping()` | `Promise<string>` | Health check |
+| `info()` | `Promise<DatabaseInfo>` | Get database info |
+| `flush()` | `Promise<void>` | Flush to disk |
+| `compact()` | `Promise<void>` | Trigger compaction |
+
+### Transactions
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `begin(readOnly?)` | `Promise<void>` | Begin transaction |
+| `commit()` | `Promise<number>` | Commit, returns version |
+| `rollback()` | `Promise<void>` | Rollback |
+| `txnInfo()` | `Promise<TransactionInfo>` | Get transaction info |
+| `txnIsActive()` | `Promise<boolean>` | Check if transaction active |
 
 ### Bundle Operations
 
-| Method | Description |
-|--------|-------------|
-| `branchExport(branch, path)` | Export branch to bundle file |
-| `branchImport(path)` | Import branch from bundle file |
-| `branchValidateBundle(path)` | Validate bundle file |
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `branchExport(branch, path)` | `Promise<BranchExportResult>` | Export branch to bundle |
+| `branchImport(path)` | `Promise<BranchImportResult>` | Import branch from bundle |
+| `branchValidateBundle(path)` | `Promise<BundleValidateResult>` | Validate bundle file |
+
+### Search
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `search(query, k?, primitives?)` | `Promise<SearchHit[]>` | Cross-primitive search |
+
+### Retention
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `retentionApply()` | `Promise<void>` | Trigger garbage collection |
 
 ## TypeScript
 
 Full TypeScript definitions are included:
 
 ```typescript
-import { Strata, JsonValue, SearchMatch } from 'stratadb';
+import { Strata, JsonValue, SearchMatch, NotFoundError } from '@stratadb/core';
 
 const db = Strata.cache();
-db.kvPut('key', { count: 42 });
-const value: JsonValue = db.kvGet('key');
+await db.kvPut('key', { count: 42 });
+const value: JsonValue = await db.kvGet('key');
 ```
 
 ## Development

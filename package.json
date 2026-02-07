@@ -2,8 +2,8 @@
   "name": "@stratadb/core",
   "version": "0.6.0",
   "description": "Node.js SDK for StrataDB - an embedded database for AI agents",
-  "main": "index.js",
-  "types": "index.d.ts",
+  "main": "stratadb.js",
+  "types": "stratadb.d.ts",
   "scripts": {
     "artifacts": "napi artifacts",
     "build": "napi build --platform --release",

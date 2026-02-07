@@ -1,13 +1,14 @@
 //! Node.js bindings for StrataDB.
 //!
 //! This module exposes the StrataDB API to Node.js via NAPI-RS.
+//! All data methods are async (backed by `spawn_blocking`) so they never
+//! block the Node.js event loop.
 
 #![deny(clippy::all)]
 
 use napi_derive::napi;
 use std::collections::HashMap;
-
-use std::cell::RefCell;
+use std::sync::{Arc, Mutex};
 
 use stratadb::{
     AccessMode, BatchVectorEntry, BranchExportResult, BranchImportResult, BundleValidateResult,
@@ -15,6 +16,9 @@ use stratadb::{
     MetadataFilter, OpenOptions, Output, Session, Strata as RustStrata, TxnOptions, Value,
     VersionedBranchInfo, VersionedValue,
 };
+
+/// Maximum nesting depth for JSON → Value conversion.
+const MAX_JSON_DEPTH: usize = 64;
 
 /// Options for opening a database.
 #[napi(object)]
@@ -25,32 +29,60 @@ pub struct JsOpenOptions {
     pub read_only: Option<bool>,
 }
 
-/// Convert a JavaScript value to a stratadb Value.
-fn js_to_value(val: serde_json::Value) -> Value {
+// ---------------------------------------------------------------------------
+// Conversion helpers
+// ---------------------------------------------------------------------------
+
+/// Convert a JavaScript value to a stratadb Value with depth checking.
+fn js_to_value_checked(val: serde_json::Value, depth: usize) -> napi::Result<Value> {
+    if depth > MAX_JSON_DEPTH {
+        return Err(napi::Error::from_reason(
+            "[VALIDATION] JSON nesting depth exceeds maximum of 64",
+        ));
+    }
     match val {
-        serde_json::Value::Null => Value::Null,
-        serde_json::Value::Bool(b) => Value::Bool(b),
+        serde_json::Value::Null => Ok(Value::Null),
+        serde_json::Value::Bool(b) => Ok(Value::Bool(b)),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                Value::Int(i)
+                Ok(Value::Int(i))
             } else if let Some(f) = n.as_f64() {
-                Value::Float(f)
+                Ok(Value::Float(f))
             } else {
-                Value::Null
+                Ok(Value::Null)
             }
         }
-        serde_json::Value::String(s) => Value::String(s),
+        serde_json::Value::String(s) => Ok(Value::String(s)),
         serde_json::Value::Array(arr) => {
-            Value::Array(arr.into_iter().map(js_to_value).collect())
+            let mut out = Vec::with_capacity(arr.len());
+            for item in arr {
+                out.push(js_to_value_checked(item, depth + 1)?);
+            }
+            Ok(Value::Array(out))
         }
         serde_json::Value::Object(map) => {
             let mut obj = HashMap::new();
             for (k, v) in map {
-                obj.insert(k, js_to_value(v));
+                obj.insert(k, js_to_value_checked(v, depth + 1)?);
             }
-            Value::Object(obj)
+            Ok(Value::Object(obj))
         }
     }
+}
+
+/// Validate a vector, rejecting NaN/Infinity, and convert f64 → f32.
+fn validate_vector(vec: &[f64]) -> napi::Result<Vec<f32>> {
+    let mut out = Vec::with_capacity(vec.len());
+    for (i, &f) in vec.iter().enumerate() {
+        if f.is_nan() || f.is_infinite() {
+            return Err(napi::Error::from_reason(format!(
+                "[VALIDATION] Vector element at index {} is not a finite number",
+                i
+            )));
+        }
+        out.push(f as f32);
+    }
+    Ok(out)
 }
 
 /// Convert a stratadb Value to a serde_json Value.
@@ -59,16 +91,11 @@ fn value_to_js(val: Value) -> serde_json::Value {
         Value::Null => serde_json::Value::Null,
         Value::Bool(b) => serde_json::Value::Bool(b),
         Value::Int(i) => serde_json::Value::Number(i.into()),
-        Value::Float(f) => {
-            serde_json::Number::from_f64(f)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null)
-        }
+        Value::Float(f) => serde_json::Number::from_f64(f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
         Value::String(s) => serde_json::Value::String(s),
-        Value::Bytes(b) => {
-            // Encode bytes as base64
-            serde_json::Value::String(base64_encode(&b))
-        }
+        Value::Bytes(b) => serde_json::Value::String(base64_encode(&b)),
         Value::Array(arr) => {
             serde_json::Value::Array(arr.into_iter().map(value_to_js).collect())
         }
@@ -96,7 +123,8 @@ fn base64_encoder(writer: &mut Vec<u8>) -> impl std::io::Write + '_ {
     struct Base64Writer<'a>(&'a mut Vec<u8>);
     impl<'a> std::io::Write for Base64Writer<'a> {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            const ALPHABET: &[u8] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
             for chunk in buf.chunks(3) {
                 let b0 = chunk[0] as usize;
                 let b1 = chunk.get(1).copied().unwrap_or(0) as usize;
@@ -116,7 +144,9 @@ fn base64_encoder(writer: &mut Vec<u8>) -> impl std::io::Write + '_ {
             }
             Ok(buf.len())
         }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
     Base64Writer(writer)
 }
@@ -130,34 +160,91 @@ fn versioned_to_js(vv: VersionedValue) -> serde_json::Value {
     })
 }
 
-/// Convert stratadb error to napi Error.
+/// Convert stratadb error to napi Error with category prefix.
 fn to_napi_err(e: StrataError) -> napi::Error {
-    napi::Error::from_reason(format!("{}", e))
+    let code = match &e {
+        StrataError::KeyNotFound { .. }
+        | StrataError::BranchNotFound { .. }
+        | StrataError::CollectionNotFound { .. }
+        | StrataError::StreamNotFound { .. }
+        | StrataError::CellNotFound { .. }
+        | StrataError::DocumentNotFound { .. } => "[NOT_FOUND]",
+
+        StrataError::InvalidKey { .. }
+        | StrataError::InvalidPath { .. }
+        | StrataError::InvalidInput { .. }
+        | StrataError::WrongType { .. } => "[VALIDATION]",
+
+        StrataError::VersionConflict { .. }
+        | StrataError::TransitionFailed { .. }
+        | StrataError::Conflict { .. }
+        | StrataError::TransactionConflict { .. } => "[CONFLICT]",
+
+        StrataError::BranchClosed { .. }
+        | StrataError::BranchExists { .. }
+        | StrataError::CollectionExists { .. }
+        | StrataError::TransactionNotActive
+        | StrataError::TransactionAlreadyActive => "[STATE]",
+
+        StrataError::DimensionMismatch { .. }
+        | StrataError::ConstraintViolation { .. }
+        | StrataError::HistoryTrimmed { .. }
+        | StrataError::Overflow { .. } => "[CONSTRAINT]",
+
+        StrataError::AccessDenied { .. } => "[ACCESS_DENIED]",
+
+        StrataError::Io { .. }
+        | StrataError::Serialization { .. }
+        | StrataError::Internal { .. }
+        | StrataError::NotImplemented { .. } => "[IO]",
+    };
+    napi::Error::from_reason(format!("{} {}", code, e))
 }
+
+/// Helper to acquire the mutex lock, mapping poison errors.
+fn lock_inner(
+    inner: &Mutex<RustStrata>,
+) -> napi::Result<std::sync::MutexGuard<'_, RustStrata>> {
+    inner
+        .lock()
+        .map_err(|_| napi::Error::from_reason("Lock poisoned"))
+}
+
+fn lock_session(
+    session: &Mutex<Option<Session>>,
+) -> napi::Result<std::sync::MutexGuard<'_, Option<Session>>> {
+    session
+        .lock()
+        .map_err(|_| napi::Error::from_reason("Lock poisoned"))
+}
+
+// ---------------------------------------------------------------------------
+// Main struct
+// ---------------------------------------------------------------------------
 
 /// StrataDB database handle.
 ///
 /// This is the main entry point for interacting with StrataDB from Node.js.
+/// All data methods are async — they run on a blocking thread pool so the
+/// Node.js event loop is never blocked.
 #[napi]
 pub struct Strata {
-    inner: RustStrata,
-    /// Session for transaction support. Lazily initialized.
-    session: RefCell<Option<Session>>,
+    inner: Arc<Mutex<RustStrata>>,
+    session: Arc<Mutex<Option<Session>>>,
 }
 
 #[napi]
 impl Strata {
+    // =========================================================================
+    // Factory methods (sync — lightweight, no I/O worth spawning for)
+    // =========================================================================
+
     /// Open a database at the given path.
-    ///
-    /// Options:
-    ///   - autoEmbed: Enable automatic text embedding for semantic search.
-    ///   - readOnly: Open in read-only mode.
     #[napi(factory)]
     pub fn open(path: String, options: Option<JsOpenOptions>) -> napi::Result<Self> {
         let auto_embed = options.as_ref().and_then(|o| o.auto_embed).unwrap_or(false);
         let read_only = options.as_ref().and_then(|o| o.read_only).unwrap_or(false);
 
-        // Auto-download model files when autoEmbed is requested (best-effort).
         #[cfg(feature = "embed")]
         if auto_embed {
             if let Err(e) = strata_intelligence::embed::download::ensure_model() {
@@ -173,20 +260,20 @@ impl Strata {
             opts = opts.access_mode(AccessMode::ReadOnly);
         }
 
-        let inner = RustStrata::open_with(&path, opts).map_err(to_napi_err)?;
+        let raw = RustStrata::open_with(&path, opts).map_err(to_napi_err)?;
         Ok(Self {
-            inner,
-            session: RefCell::new(None),
+            inner: Arc::new(Mutex::new(raw)),
+            session: Arc::new(Mutex::new(None)),
         })
     }
 
     /// Create an in-memory database (no persistence).
     #[napi(factory)]
     pub fn cache() -> napi::Result<Self> {
-        let inner = RustStrata::cache().map_err(to_napi_err)?;
+        let raw = RustStrata::cache().map_err(to_napi_err)?;
         Ok(Self {
-            inner,
-            session: RefCell::new(None),
+            inner: Arc::new(Mutex::new(raw)),
+            session: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -196,45 +283,73 @@ impl Strata {
 
     /// Store a key-value pair.
     #[napi(js_name = "kvPut")]
-    pub fn kv_put(&self, key: String, value: serde_json::Value) -> napi::Result<u32> {
-        let v = js_to_value(value);
-        self.inner.kv_put(&key, v).map(|n| n as u32).map_err(to_napi_err)
+    pub async fn kv_put(&self, key: String, value: serde_json::Value) -> napi::Result<i64> {
+        let inner = self.inner.clone();
+        let v = js_to_value_checked(value, 0)?;
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            guard.kv_put(&key, v).map(|n| n as i64).map_err(to_napi_err)
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Get a value by key.
     #[napi(js_name = "kvGet")]
-    pub fn kv_get(&self, key: String) -> napi::Result<serde_json::Value> {
-        match self.inner.kv_get(&key).map_err(to_napi_err)? {
-            Some(v) => Ok(value_to_js(v)),
-            None => Ok(serde_json::Value::Null),
-        }
+    pub async fn kv_get(&self, key: String) -> napi::Result<serde_json::Value> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            match guard.kv_get(&key).map_err(to_napi_err)? {
+                Some(v) => Ok(value_to_js(v)),
+                None => Ok(serde_json::Value::Null),
+            }
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Delete a key.
     #[napi(js_name = "kvDelete")]
-    pub fn kv_delete(&self, key: String) -> napi::Result<bool> {
-        self.inner.kv_delete(&key).map_err(to_napi_err)
+    pub async fn kv_delete(&self, key: String) -> napi::Result<bool> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            guard.kv_delete(&key).map_err(to_napi_err)
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// List keys with optional prefix filter.
     #[napi(js_name = "kvList")]
-    pub fn kv_list(&self, prefix: Option<String>) -> napi::Result<Vec<String>> {
-        self.inner.kv_list(prefix.as_deref()).map_err(to_napi_err)
+    pub async fn kv_list(&self, prefix: Option<String>) -> napi::Result<Vec<String>> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            guard.kv_list(prefix.as_deref()).map_err(to_napi_err)
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Get version history for a key.
     #[napi(js_name = "kvHistory")]
-    pub fn kv_history(&self, key: String) -> napi::Result<serde_json::Value> {
-        match self.inner.kv_getv(&key).map_err(to_napi_err)? {
-            Some(versions) => {
-                let arr: Vec<serde_json::Value> = versions
-                    .into_iter()
-                    .map(versioned_to_js)
-                    .collect();
-                Ok(serde_json::Value::Array(arr))
+    pub async fn kv_history(&self, key: String) -> napi::Result<serde_json::Value> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            match guard.kv_getv(&key).map_err(to_napi_err)? {
+                Some(versions) => {
+                    let arr: Vec<serde_json::Value> =
+                        versions.into_iter().map(versioned_to_js).collect();
+                    Ok(serde_json::Value::Array(arr))
+                }
+                None => Ok(serde_json::Value::Null),
             }
-            None => Ok(serde_json::Value::Null),
-        }
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     // =========================================================================
@@ -243,56 +358,90 @@ impl Strata {
 
     /// Set a state cell value.
     #[napi(js_name = "stateSet")]
-    pub fn state_set(&self, cell: String, value: serde_json::Value) -> napi::Result<u32> {
-        let v = js_to_value(value);
-        self.inner.state_set(&cell, v).map(|n| n as u32).map_err(to_napi_err)
+    pub async fn state_set(&self, cell: String, value: serde_json::Value) -> napi::Result<i64> {
+        let inner = self.inner.clone();
+        let v = js_to_value_checked(value, 0)?;
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            guard
+                .state_set(&cell, v)
+                .map(|n| n as i64)
+                .map_err(to_napi_err)
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Get a state cell value.
     #[napi(js_name = "stateGet")]
-    pub fn state_get(&self, cell: String) -> napi::Result<serde_json::Value> {
-        match self.inner.state_get(&cell).map_err(to_napi_err)? {
-            Some(v) => Ok(value_to_js(v)),
-            None => Ok(serde_json::Value::Null),
-        }
+    pub async fn state_get(&self, cell: String) -> napi::Result<serde_json::Value> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            match guard.state_get(&cell).map_err(to_napi_err)? {
+                Some(v) => Ok(value_to_js(v)),
+                None => Ok(serde_json::Value::Null),
+            }
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Initialize a state cell if it doesn't exist.
     #[napi(js_name = "stateInit")]
-    pub fn state_init(&self, cell: String, value: serde_json::Value) -> napi::Result<u32> {
-        let v = js_to_value(value);
-        self.inner.state_init(&cell, v).map(|n| n as u32).map_err(to_napi_err)
+    pub async fn state_init(&self, cell: String, value: serde_json::Value) -> napi::Result<i64> {
+        let inner = self.inner.clone();
+        let v = js_to_value_checked(value, 0)?;
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            guard
+                .state_init(&cell, v)
+                .map(|n| n as i64)
+                .map_err(to_napi_err)
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Compare-and-swap update based on version.
     #[napi(js_name = "stateCas")]
-    pub fn state_cas(
+    pub async fn state_cas(
         &self,
         cell: String,
         new_value: serde_json::Value,
-        expected_version: Option<u32>,
-    ) -> napi::Result<Option<u32>> {
-        let v = js_to_value(new_value);
+        expected_version: Option<i64>,
+    ) -> napi::Result<Option<i64>> {
+        let inner = self.inner.clone();
+        let v = js_to_value_checked(new_value, 0)?;
         let exp = expected_version.map(|n| n as u64);
-        self.inner
-            .state_cas(&cell, exp, v)
-            .map(|opt| opt.map(|n| n as u32))
-            .map_err(to_napi_err)
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            guard
+                .state_cas(&cell, exp, v)
+                .map(|opt| opt.map(|n| n as i64))
+                .map_err(to_napi_err)
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Get version history for a state cell.
     #[napi(js_name = "stateHistory")]
-    pub fn state_history(&self, cell: String) -> napi::Result<serde_json::Value> {
-        match self.inner.state_getv(&cell).map_err(to_napi_err)? {
-            Some(versions) => {
-                let arr: Vec<serde_json::Value> = versions
-                    .into_iter()
-                    .map(versioned_to_js)
-                    .collect();
-                Ok(serde_json::Value::Array(arr))
+    pub async fn state_history(&self, cell: String) -> napi::Result<serde_json::Value> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            match guard.state_getv(&cell).map_err(to_napi_err)? {
+                Some(versions) => {
+                    let arr: Vec<serde_json::Value> =
+                        versions.into_iter().map(versioned_to_js).collect();
+                    Ok(serde_json::Value::Array(arr))
+                }
+                None => Ok(serde_json::Value::Null),
             }
-            None => Ok(serde_json::Value::Null),
-        }
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     // =========================================================================
@@ -301,32 +450,63 @@ impl Strata {
 
     /// Append an event to the log.
     #[napi(js_name = "eventAppend")]
-    pub fn event_append(&self, event_type: String, payload: serde_json::Value) -> napi::Result<u32> {
-        let v = js_to_value(payload);
-        self.inner.event_append(&event_type, v).map(|n| n as u32).map_err(to_napi_err)
+    pub async fn event_append(
+        &self,
+        event_type: String,
+        payload: serde_json::Value,
+    ) -> napi::Result<i64> {
+        let inner = self.inner.clone();
+        let v = js_to_value_checked(payload, 0)?;
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            guard
+                .event_append(&event_type, v)
+                .map(|n| n as i64)
+                .map_err(to_napi_err)
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Get an event by sequence number.
     #[napi(js_name = "eventGet")]
-    pub fn event_get(&self, sequence: u32) -> napi::Result<serde_json::Value> {
-        match self.inner.event_get(sequence as u64).map_err(to_napi_err)? {
-            Some(vv) => Ok(versioned_to_js(vv)),
-            None => Ok(serde_json::Value::Null),
-        }
+    pub async fn event_get(&self, sequence: i64) -> napi::Result<serde_json::Value> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            match guard.event_get(sequence as u64).map_err(to_napi_err)? {
+                Some(vv) => Ok(versioned_to_js(vv)),
+                None => Ok(serde_json::Value::Null),
+            }
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// List events by type.
     #[napi(js_name = "eventList")]
-    pub fn event_list(&self, event_type: String) -> napi::Result<serde_json::Value> {
-        let events = self.inner.event_get_by_type(&event_type).map_err(to_napi_err)?;
-        let arr: Vec<serde_json::Value> = events.into_iter().map(versioned_to_js).collect();
-        Ok(serde_json::Value::Array(arr))
+    pub async fn event_list(&self, event_type: String) -> napi::Result<serde_json::Value> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            let events = guard.event_get_by_type(&event_type).map_err(to_napi_err)?;
+            let arr: Vec<serde_json::Value> = events.into_iter().map(versioned_to_js).collect();
+            Ok(serde_json::Value::Array(arr))
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Get total event count.
     #[napi(js_name = "eventLen")]
-    pub fn event_len(&self) -> napi::Result<u32> {
-        self.inner.event_len().map(|n| n as u32).map_err(to_napi_err)
+    pub async fn event_len(&self) -> napi::Result<i64> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            guard.event_len().map(|n| n as i64).map_err(to_napi_err)
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     // =========================================================================
@@ -335,57 +515,95 @@ impl Strata {
 
     /// Set a value at a JSONPath.
     #[napi(js_name = "jsonSet")]
-    pub fn json_set(&self, key: String, path: String, value: serde_json::Value) -> napi::Result<u32> {
-        let v = js_to_value(value);
-        self.inner.json_set(&key, &path, v).map(|n| n as u32).map_err(to_napi_err)
+    pub async fn json_set(
+        &self,
+        key: String,
+        path: String,
+        value: serde_json::Value,
+    ) -> napi::Result<i64> {
+        let inner = self.inner.clone();
+        let v = js_to_value_checked(value, 0)?;
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            guard
+                .json_set(&key, &path, v)
+                .map(|n| n as i64)
+                .map_err(to_napi_err)
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Get a value at a JSONPath.
     #[napi(js_name = "jsonGet")]
-    pub fn json_get(&self, key: String, path: String) -> napi::Result<serde_json::Value> {
-        match self.inner.json_get(&key, &path).map_err(to_napi_err)? {
-            Some(v) => Ok(value_to_js(v)),
-            None => Ok(serde_json::Value::Null),
-        }
+    pub async fn json_get(&self, key: String, path: String) -> napi::Result<serde_json::Value> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            match guard.json_get(&key, &path).map_err(to_napi_err)? {
+                Some(v) => Ok(value_to_js(v)),
+                None => Ok(serde_json::Value::Null),
+            }
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Delete a JSON document.
     #[napi(js_name = "jsonDelete")]
-    pub fn json_delete(&self, key: String, path: String) -> napi::Result<u32> {
-        self.inner.json_delete(&key, &path).map(|n| n as u32).map_err(to_napi_err)
+    pub async fn json_delete(&self, key: String, path: String) -> napi::Result<i64> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            guard
+                .json_delete(&key, &path)
+                .map(|n| n as i64)
+                .map_err(to_napi_err)
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Get version history for a JSON document.
     #[napi(js_name = "jsonHistory")]
-    pub fn json_history(&self, key: String) -> napi::Result<serde_json::Value> {
-        match self.inner.json_getv(&key).map_err(to_napi_err)? {
-            Some(versions) => {
-                let arr: Vec<serde_json::Value> = versions
-                    .into_iter()
-                    .map(versioned_to_js)
-                    .collect();
-                Ok(serde_json::Value::Array(arr))
+    pub async fn json_history(&self, key: String) -> napi::Result<serde_json::Value> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            match guard.json_getv(&key).map_err(to_napi_err)? {
+                Some(versions) => {
+                    let arr: Vec<serde_json::Value> =
+                        versions.into_iter().map(versioned_to_js).collect();
+                    Ok(serde_json::Value::Array(arr))
+                }
+                None => Ok(serde_json::Value::Null),
             }
-            None => Ok(serde_json::Value::Null),
-        }
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// List JSON document keys.
     #[napi(js_name = "jsonList")]
-    pub fn json_list(
+    pub async fn json_list(
         &self,
         limit: u32,
         prefix: Option<String>,
         cursor: Option<String>,
     ) -> napi::Result<serde_json::Value> {
-        let (keys, next_cursor) = self
-            .inner
-            .json_list(prefix, cursor, limit as u64)
-            .map_err(to_napi_err)?;
-        Ok(serde_json::json!({
-            "keys": keys,
-            "cursor": next_cursor,
-        }))
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            let (keys, next_cursor) = guard
+                .json_list(prefix, cursor, limit as u64)
+                .map_err(to_napi_err)?;
+            Ok(serde_json::json!({
+                "keys": keys,
+                "cursor": next_cursor,
+            }))
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     // =========================================================================
@@ -394,148 +612,213 @@ impl Strata {
 
     /// Create a vector collection.
     #[napi(js_name = "vectorCreateCollection")]
-    pub fn vector_create_collection(
+    pub async fn vector_create_collection(
         &self,
         collection: String,
         dimension: u32,
         metric: Option<String>,
-    ) -> napi::Result<u32> {
+    ) -> napi::Result<i64> {
+        let inner = self.inner.clone();
         let m = match metric.as_deref().unwrap_or("cosine") {
             "cosine" => DistanceMetric::Cosine,
             "euclidean" => DistanceMetric::Euclidean,
             "dot_product" | "dotproduct" => DistanceMetric::DotProduct,
-            _ => return Err(napi::Error::from_reason("Invalid metric")),
+            _ => return Err(napi::Error::from_reason("[VALIDATION] Invalid metric")),
         };
-        self.inner
-            .vector_create_collection(&collection, dimension as u64, m)
-            .map(|n| n as u32)
-            .map_err(to_napi_err)
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            guard
+                .vector_create_collection(&collection, dimension as u64, m)
+                .map(|n| n as i64)
+                .map_err(to_napi_err)
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Delete a vector collection.
     #[napi(js_name = "vectorDeleteCollection")]
-    pub fn vector_delete_collection(&self, collection: String) -> napi::Result<bool> {
-        self.inner
-            .vector_delete_collection(&collection)
-            .map_err(to_napi_err)
+    pub async fn vector_delete_collection(&self, collection: String) -> napi::Result<bool> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            guard
+                .vector_delete_collection(&collection)
+                .map_err(to_napi_err)
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// List vector collections.
     #[napi(js_name = "vectorListCollections")]
-    pub fn vector_list_collections(&self) -> napi::Result<serde_json::Value> {
-        let collections = self.inner.vector_list_collections().map_err(to_napi_err)?;
-        let arr: Vec<serde_json::Value> = collections
-            .into_iter()
-            .map(collection_info_to_js)
-            .collect();
-        Ok(serde_json::Value::Array(arr))
+    pub async fn vector_list_collections(&self) -> napi::Result<serde_json::Value> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            let collections = guard.vector_list_collections().map_err(to_napi_err)?;
+            let arr: Vec<serde_json::Value> =
+                collections.into_iter().map(collection_info_to_js).collect();
+            Ok(serde_json::Value::Array(arr))
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Insert or update a vector.
     #[napi(js_name = "vectorUpsert")]
-    pub fn vector_upsert(
+    pub async fn vector_upsert(
         &self,
         collection: String,
         key: String,
         vector: Vec<f64>,
         metadata: Option<serde_json::Value>,
-    ) -> napi::Result<u32> {
-        let vec: Vec<f32> = vector.iter().map(|&f| f as f32).collect();
-        let meta = metadata.map(js_to_value);
-        self.inner
-            .vector_upsert(&collection, &key, vec, meta)
-            .map(|n| n as u32)
-            .map_err(to_napi_err)
+    ) -> napi::Result<i64> {
+        let inner = self.inner.clone();
+        let vec = validate_vector(&vector)?;
+        let meta = match metadata {
+            Some(m) => Some(js_to_value_checked(m, 0)?),
+            None => None,
+        };
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            guard
+                .vector_upsert(&collection, &key, vec, meta)
+                .map(|n| n as i64)
+                .map_err(to_napi_err)
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Get a vector by key.
     #[napi(js_name = "vectorGet")]
-    pub fn vector_get(&self, collection: String, key: String) -> napi::Result<serde_json::Value> {
-        match self.inner.vector_get(&collection, &key).map_err(to_napi_err)? {
-            Some(vd) => {
-                let embedding: Vec<f64> = vd.data.embedding.iter().map(|&f| f as f64).collect();
-                Ok(serde_json::json!({
-                    "key": vd.key,
-                    "embedding": embedding,
-                    "metadata": vd.data.metadata.map(value_to_js),
-                    "version": vd.version,
-                    "timestamp": vd.timestamp,
-                }))
+    pub async fn vector_get(
+        &self,
+        collection: String,
+        key: String,
+    ) -> napi::Result<serde_json::Value> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            match guard.vector_get(&collection, &key).map_err(to_napi_err)? {
+                Some(vd) => {
+                    let embedding: Vec<f64> =
+                        vd.data.embedding.iter().map(|&f| f as f64).collect();
+                    Ok(serde_json::json!({
+                        "key": vd.key,
+                        "embedding": embedding,
+                        "metadata": vd.data.metadata.map(value_to_js),
+                        "version": vd.version,
+                        "timestamp": vd.timestamp,
+                    }))
+                }
+                None => Ok(serde_json::Value::Null),
             }
-            None => Ok(serde_json::Value::Null),
-        }
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Delete a vector.
     #[napi(js_name = "vectorDelete")]
-    pub fn vector_delete(&self, collection: String, key: String) -> napi::Result<bool> {
-        self.inner.vector_delete(&collection, &key).map_err(to_napi_err)
+    pub async fn vector_delete(&self, collection: String, key: String) -> napi::Result<bool> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            guard.vector_delete(&collection, &key).map_err(to_napi_err)
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Search for similar vectors.
     #[napi(js_name = "vectorSearch")]
-    pub fn vector_search(
+    pub async fn vector_search(
         &self,
         collection: String,
         query: Vec<f64>,
         k: u32,
     ) -> napi::Result<serde_json::Value> {
-        let vec: Vec<f32> = query.iter().map(|&f| f as f32).collect();
-        let matches = self
-            .inner
-            .vector_search(&collection, vec, k as u64)
-            .map_err(to_napi_err)?;
-        let arr: Vec<serde_json::Value> = matches
-            .into_iter()
-            .map(|m| {
-                serde_json::json!({
-                    "key": m.key,
-                    "score": m.score,
-                    "metadata": m.metadata.map(value_to_js),
+        let inner = self.inner.clone();
+        let vec = validate_vector(&query)?;
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            let matches = guard
+                .vector_search(&collection, vec, k as u64)
+                .map_err(to_napi_err)?;
+            let arr: Vec<serde_json::Value> = matches
+                .into_iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "key": m.key,
+                        "score": m.score,
+                        "metadata": m.metadata.map(value_to_js),
+                    })
                 })
-            })
-            .collect();
-        Ok(serde_json::Value::Array(arr))
+                .collect();
+            Ok(serde_json::Value::Array(arr))
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Get statistics for a single collection.
     #[napi(js_name = "vectorCollectionStats")]
-    pub fn vector_collection_stats(&self, collection: String) -> napi::Result<serde_json::Value> {
-        let info = self
-            .inner
-            .vector_collection_stats(&collection)
-            .map_err(to_napi_err)?;
-        Ok(collection_info_to_js(info))
+    pub async fn vector_collection_stats(
+        &self,
+        collection: String,
+    ) -> napi::Result<serde_json::Value> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            let info = guard
+                .vector_collection_stats(&collection)
+                .map_err(to_napi_err)?;
+            Ok(collection_info_to_js(info))
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Batch insert/update multiple vectors.
-    ///
-    /// Each vector should be an object with 'key', 'vector', and optional 'metadata'.
     #[napi(js_name = "vectorBatchUpsert")]
-    pub fn vector_batch_upsert(
+    pub async fn vector_batch_upsert(
         &self,
         collection: String,
         vectors: Vec<serde_json::Value>,
-    ) -> napi::Result<Vec<u32>> {
+    ) -> napi::Result<Vec<i64>> {
+        let inner = self.inner.clone();
+        // Parse and validate all entries on the JS thread before spawning.
         let batch: Vec<BatchVectorEntry> = vectors
             .into_iter()
             .map(|v| {
                 let obj = v
                     .as_object()
-                    .ok_or_else(|| napi::Error::from_reason("Expected object"))?;
+                    .ok_or_else(|| napi::Error::from_reason("[VALIDATION] Expected object"))?;
                 let key = obj
                     .get("key")
                     .and_then(|k| k.as_str())
-                    .ok_or_else(|| napi::Error::from_reason("Missing 'key'"))?
+                    .ok_or_else(|| napi::Error::from_reason("[VALIDATION] Missing 'key'"))?
                     .to_string();
-                let vec: Vec<f32> = obj
+                let raw_vec: Vec<f64> = obj
                     .get("vector")
                     .and_then(|v| v.as_array())
-                    .ok_or_else(|| napi::Error::from_reason("Missing 'vector'"))?
+                    .ok_or_else(|| napi::Error::from_reason("[VALIDATION] Missing 'vector'"))?
                     .iter()
-                    .map(|n| n.as_f64().unwrap_or(0.0) as f32)
-                    .collect();
-                let meta = obj.get("metadata").map(|m| js_to_value(m.clone()));
+                    .map(|n| {
+                        n.as_f64().ok_or_else(|| {
+                            napi::Error::from_reason(
+                                "[VALIDATION] Vector element is not a number",
+                            )
+                        })
+                    })
+                    .collect::<napi::Result<_>>()?;
+                let vec = validate_vector(&raw_vec)?;
+                let meta = match obj.get("metadata") {
+                    Some(m) => Some(js_to_value_checked(m.clone(), 0)?),
+                    None => None,
+                };
                 Ok(BatchVectorEntry {
                     key,
                     vector: vec,
@@ -543,10 +826,15 @@ impl Strata {
                 })
             })
             .collect::<napi::Result<_>>()?;
-        self.inner
-            .vector_batch_upsert(&collection, batch)
-            .map(|versions| versions.into_iter().map(|v| v as u32).collect())
-            .map_err(to_napi_err)
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            guard
+                .vector_batch_upsert(&collection, batch)
+                .map(|versions| versions.into_iter().map(|v| v as i64).collect())
+                .map_err(to_napi_err)
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     // =========================================================================
@@ -555,112 +843,174 @@ impl Strata {
 
     /// Get the current branch name.
     #[napi(js_name = "currentBranch")]
-    pub fn current_branch(&self) -> String {
-        self.inner.current_branch().to_string()
+    pub async fn current_branch(&self) -> napi::Result<String> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            Ok(guard.current_branch().to_string())
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Switch to a different branch.
     #[napi(js_name = "setBranch")]
-    pub fn set_branch(&mut self, branch: String) -> napi::Result<()> {
-        self.inner.set_branch(&branch).map_err(to_napi_err)
+    pub async fn set_branch(&self, branch: String) -> napi::Result<()> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner
+                .lock()
+                .map_err(|_| napi::Error::from_reason("Lock poisoned"))?;
+            guard.set_branch(&branch).map_err(to_napi_err)
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Create a new empty branch.
     #[napi(js_name = "createBranch")]
-    pub fn create_branch(&self, branch: String) -> napi::Result<()> {
-        self.inner.create_branch(&branch).map_err(to_napi_err)
+    pub async fn create_branch(&self, branch: String) -> napi::Result<()> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            guard.create_branch(&branch).map_err(to_napi_err)
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Fork the current branch to a new branch, copying all data.
     #[napi(js_name = "forkBranch")]
-    pub fn fork_branch(&self, destination: String) -> napi::Result<serde_json::Value> {
-        let info = self.inner.fork_branch(&destination).map_err(to_napi_err)?;
-        Ok(serde_json::json!({
-            "source": info.source,
-            "destination": info.destination,
-            "keysCopied": info.keys_copied,
-        }))
+    pub async fn fork_branch(&self, destination: String) -> napi::Result<serde_json::Value> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            let info = guard.fork_branch(&destination).map_err(to_napi_err)?;
+            Ok(serde_json::json!({
+                "source": info.source,
+                "destination": info.destination,
+                "keysCopied": info.keys_copied,
+            }))
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// List all branches.
     #[napi(js_name = "listBranches")]
-    pub fn list_branches(&self) -> napi::Result<Vec<String>> {
-        self.inner.list_branches().map_err(to_napi_err)
+    pub async fn list_branches(&self) -> napi::Result<Vec<String>> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            guard.list_branches().map_err(to_napi_err)
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Delete a branch.
     #[napi(js_name = "deleteBranch")]
-    pub fn delete_branch(&self, branch: String) -> napi::Result<()> {
-        self.inner.delete_branch(&branch).map_err(to_napi_err)
+    pub async fn delete_branch(&self, branch: String) -> napi::Result<()> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            guard.delete_branch(&branch).map_err(to_napi_err)
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Check if a branch exists.
     #[napi(js_name = "branchExists")]
-    pub fn branch_exists(&self, name: String) -> napi::Result<bool> {
-        self.inner.branches().exists(&name).map_err(to_napi_err)
+    pub async fn branch_exists(&self, name: String) -> napi::Result<bool> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            guard.branches().exists(&name).map_err(to_napi_err)
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Get branch metadata with version info.
-    ///
-    /// Returns an object with branch info, or null if the branch does not exist.
     #[napi(js_name = "branchGet")]
-    pub fn branch_get(&self, name: String) -> napi::Result<serde_json::Value> {
-        match self.inner.branch_get(&name).map_err(to_napi_err)? {
-            Some(info) => Ok(versioned_branch_info_to_js(info)),
-            None => Ok(serde_json::Value::Null),
-        }
+    pub async fn branch_get(&self, name: String) -> napi::Result<serde_json::Value> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            match guard.branch_get(&name).map_err(to_napi_err)? {
+                Some(info) => Ok(versioned_branch_info_to_js(info)),
+                None => Ok(serde_json::Value::Null),
+            }
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Compare two branches.
     #[napi(js_name = "diffBranches")]
-    pub fn diff_branches(&self, branch_a: String, branch_b: String) -> napi::Result<serde_json::Value> {
-        let diff = self
-            .inner
-            .diff_branches(&branch_a, &branch_b)
-            .map_err(to_napi_err)?;
-        Ok(serde_json::json!({
-            "branchA": diff.branch_a,
-            "branchB": diff.branch_b,
-            "summary": {
-                "totalAdded": diff.summary.total_added,
-                "totalRemoved": diff.summary.total_removed,
-                "totalModified": diff.summary.total_modified,
-            },
-        }))
+    pub async fn diff_branches(
+        &self,
+        branch_a: String,
+        branch_b: String,
+    ) -> napi::Result<serde_json::Value> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            let diff = guard
+                .diff_branches(&branch_a, &branch_b)
+                .map_err(to_napi_err)?;
+            Ok(serde_json::json!({
+                "branchA": diff.branch_a,
+                "branchB": diff.branch_b,
+                "summary": {
+                    "totalAdded": diff.summary.total_added,
+                    "totalRemoved": diff.summary.total_removed,
+                    "totalModified": diff.summary.total_modified,
+                },
+            }))
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Merge a branch into the current branch.
     #[napi(js_name = "mergeBranches")]
-    pub fn merge_branches(
+    pub async fn merge_branches(
         &self,
         source: String,
         strategy: Option<String>,
     ) -> napi::Result<serde_json::Value> {
+        let inner = self.inner.clone();
         let strat = match strategy.as_deref().unwrap_or("last_writer_wins") {
             "last_writer_wins" => MergeStrategy::LastWriterWins,
             "strict" => MergeStrategy::Strict,
-            _ => return Err(napi::Error::from_reason("Invalid merge strategy")),
+            _ => return Err(napi::Error::from_reason("[VALIDATION] Invalid merge strategy")),
         };
-        let target = self.inner.current_branch().to_string();
-        let info = self
-            .inner
-            .merge_branches(&source, &target, strat)
-            .map_err(to_napi_err)?;
-        let conflicts: Vec<serde_json::Value> = info
-            .conflicts
-            .into_iter()
-            .map(|c| {
-                serde_json::json!({
-                    "key": c.key,
-                    "space": c.space,
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            let target = guard.current_branch().to_string();
+            let info = guard
+                .merge_branches(&source, &target, strat)
+                .map_err(to_napi_err)?;
+            let conflicts: Vec<serde_json::Value> = info
+                .conflicts
+                .into_iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "key": c.key,
+                        "space": c.space,
+                    })
                 })
-            })
-            .collect();
-        Ok(serde_json::json!({
-            "keysApplied": info.keys_applied,
-            "spacesMerged": info.spaces_merged,
-            "conflicts": conflicts,
-        }))
+                .collect();
+            Ok(serde_json::json!({
+                "keysApplied": info.keys_applied,
+                "spacesMerged": info.spaces_merged,
+                "conflicts": conflicts,
+            }))
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     // =========================================================================
@@ -669,32 +1019,64 @@ impl Strata {
 
     /// Get the current space name.
     #[napi(js_name = "currentSpace")]
-    pub fn current_space(&self) -> String {
-        self.inner.current_space().to_string()
+    pub async fn current_space(&self) -> napi::Result<String> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            Ok(guard.current_space().to_string())
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Switch to a different space.
     #[napi(js_name = "setSpace")]
-    pub fn set_space(&mut self, space: String) -> napi::Result<()> {
-        self.inner.set_space(&space).map_err(to_napi_err)
+    pub async fn set_space(&self, space: String) -> napi::Result<()> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner
+                .lock()
+                .map_err(|_| napi::Error::from_reason("Lock poisoned"))?;
+            guard.set_space(&space).map_err(to_napi_err)
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// List all spaces in the current branch.
     #[napi(js_name = "listSpaces")]
-    pub fn list_spaces(&self) -> napi::Result<Vec<String>> {
-        self.inner.list_spaces().map_err(to_napi_err)
+    pub async fn list_spaces(&self) -> napi::Result<Vec<String>> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            guard.list_spaces().map_err(to_napi_err)
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Delete a space and all its data.
     #[napi(js_name = "deleteSpace")]
-    pub fn delete_space(&self, space: String) -> napi::Result<()> {
-        self.inner.delete_space(&space).map_err(to_napi_err)
+    pub async fn delete_space(&self, space: String) -> napi::Result<()> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            guard.delete_space(&space).map_err(to_napi_err)
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Force delete a space even if non-empty.
     #[napi(js_name = "deleteSpaceForce")]
-    pub fn delete_space_force(&self, space: String) -> napi::Result<()> {
-        self.inner.delete_space_force(&space).map_err(to_napi_err)
+    pub async fn delete_space_force(&self, space: String) -> napi::Result<()> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            guard.delete_space_force(&space).map_err(to_napi_err)
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     // =========================================================================
@@ -703,32 +1085,56 @@ impl Strata {
 
     /// Check database connectivity.
     #[napi]
-    pub fn ping(&self) -> napi::Result<String> {
-        self.inner.ping().map_err(to_napi_err)
+    pub async fn ping(&self) -> napi::Result<String> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            guard.ping().map_err(to_napi_err)
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Get database info.
     #[napi]
-    pub fn info(&self) -> napi::Result<serde_json::Value> {
-        let info = self.inner.info().map_err(to_napi_err)?;
-        Ok(serde_json::json!({
-            "version": info.version,
-            "uptimeSecs": info.uptime_secs,
-            "branchCount": info.branch_count,
-            "totalKeys": info.total_keys,
-        }))
+    pub async fn info(&self) -> napi::Result<serde_json::Value> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            let info = guard.info().map_err(to_napi_err)?;
+            Ok(serde_json::json!({
+                "version": info.version,
+                "uptimeSecs": info.uptime_secs,
+                "branchCount": info.branch_count,
+                "totalKeys": info.total_keys,
+            }))
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Flush writes to disk.
     #[napi]
-    pub fn flush(&self) -> napi::Result<()> {
-        self.inner.flush().map_err(to_napi_err)
+    pub async fn flush(&self) -> napi::Result<()> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            guard.flush().map_err(to_napi_err)
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Trigger compaction.
     #[napi]
-    pub fn compact(&self) -> napi::Result<()> {
-        self.inner.compact().map_err(to_napi_err)
+    pub async fn compact(&self) -> napi::Result<()> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            guard.compact().map_err(to_napi_err)
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     // =========================================================================
@@ -737,278 +1143,336 @@ impl Strata {
 
     /// Export a branch to a bundle file.
     #[napi(js_name = "branchExport")]
-    pub fn branch_export(&self, branch: String, path: String) -> napi::Result<serde_json::Value> {
-        let result = self
-            .inner
-            .branch_export(&branch, &path)
-            .map_err(to_napi_err)?;
-        Ok(branch_export_result_to_js(result))
+    pub async fn branch_export(
+        &self,
+        branch: String,
+        path: String,
+    ) -> napi::Result<serde_json::Value> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            let result = guard.branch_export(&branch, &path).map_err(to_napi_err)?;
+            Ok(branch_export_result_to_js(result))
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Import a branch from a bundle file.
     #[napi(js_name = "branchImport")]
-    pub fn branch_import(&self, path: String) -> napi::Result<serde_json::Value> {
-        let result = self.inner.branch_import(&path).map_err(to_napi_err)?;
-        Ok(branch_import_result_to_js(result))
+    pub async fn branch_import(&self, path: String) -> napi::Result<serde_json::Value> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            let result = guard.branch_import(&path).map_err(to_napi_err)?;
+            Ok(branch_import_result_to_js(result))
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Validate a bundle file without importing.
     #[napi(js_name = "branchValidateBundle")]
-    pub fn branch_validate_bundle(&self, path: String) -> napi::Result<serde_json::Value> {
-        let result = self
-            .inner
-            .branch_validate_bundle(&path)
-            .map_err(to_napi_err)?;
-        Ok(bundle_validate_result_to_js(result))
+    pub async fn branch_validate_bundle(&self, path: String) -> napi::Result<serde_json::Value> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            let result = guard.branch_validate_bundle(&path).map_err(to_napi_err)?;
+            Ok(bundle_validate_result_to_js(result))
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     // =========================================================================
-    // Transaction Operations (MVP+1)
+    // Transaction Operations
     // =========================================================================
 
     /// Begin a new transaction.
-    ///
-    /// All subsequent data operations will be part of this transaction until
-    /// commit() or rollback() is called.
     #[napi(js_name = "begin")]
-    pub fn begin(&self, read_only: Option<bool>) -> napi::Result<()> {
-        let mut session_ref = self.session.borrow_mut();
-        if session_ref.is_none() {
-            *session_ref = Some(self.inner.session());
-        }
-        let session = session_ref.as_mut().unwrap();
-
-        let cmd = Command::TxnBegin {
-            branch: None,
-            options: Some(TxnOptions {
-                read_only: read_only.unwrap_or(false),
-            }),
-        };
-        session.execute(cmd).map_err(to_napi_err)?;
-        Ok(())
+    pub async fn begin(&self, read_only: Option<bool>) -> napi::Result<()> {
+        let inner = self.inner.clone();
+        let session_arc = self.session.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut session_ref = lock_session(&session_arc)?;
+            if session_ref.is_none() {
+                let guard = lock_inner(&inner)?;
+                *session_ref = Some(guard.session());
+            }
+            let session = session_ref.as_mut().unwrap();
+            let cmd = Command::TxnBegin {
+                branch: None,
+                options: Some(TxnOptions {
+                    read_only: read_only.unwrap_or(false),
+                }),
+            };
+            session.execute(cmd).map_err(to_napi_err)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Commit the current transaction.
-    ///
-    /// Returns the commit version number.
     #[napi]
-    pub fn commit(&self) -> napi::Result<u32> {
-        let mut session_ref = self.session.borrow_mut();
-        let session = session_ref
-            .as_mut()
-            .ok_or_else(|| napi::Error::from_reason("No transaction active"))?;
-
-        match session.execute(Command::TxnCommit).map_err(to_napi_err)? {
-            Output::TxnCommitted { version } => Ok(version as u32),
-            _ => Err(napi::Error::from_reason("Unexpected output for TxnCommit")),
-        }
+    pub async fn commit(&self) -> napi::Result<i64> {
+        let session_arc = self.session.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut session_ref = lock_session(&session_arc)?;
+            let session = session_ref
+                .as_mut()
+                .ok_or_else(|| napi::Error::from_reason("[STATE] No transaction active"))?;
+            match session.execute(Command::TxnCommit).map_err(to_napi_err)? {
+                Output::TxnCommitted { version } => Ok(version as i64),
+                _ => Err(napi::Error::from_reason("Unexpected output for TxnCommit")),
+            }
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Rollback the current transaction.
     #[napi]
-    pub fn rollback(&self) -> napi::Result<()> {
-        let mut session_ref = self.session.borrow_mut();
-        let session = session_ref
-            .as_mut()
-            .ok_or_else(|| napi::Error::from_reason("No transaction active"))?;
-
-        session.execute(Command::TxnRollback).map_err(to_napi_err)?;
-        Ok(())
+    pub async fn rollback(&self) -> napi::Result<()> {
+        let session_arc = self.session.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut session_ref = lock_session(&session_arc)?;
+            let session = session_ref
+                .as_mut()
+                .ok_or_else(|| napi::Error::from_reason("[STATE] No transaction active"))?;
+            session.execute(Command::TxnRollback).map_err(to_napi_err)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Get current transaction info.
-    ///
-    /// Returns an object with 'id', 'status', 'startedAt', or null if no transaction is active.
     #[napi(js_name = "txnInfo")]
-    pub fn txn_info(&self) -> napi::Result<serde_json::Value> {
-        let mut session_ref = self.session.borrow_mut();
-        if session_ref.is_none() {
-            return Ok(serde_json::Value::Null);
-        }
-        let session = session_ref.as_mut().unwrap();
-
-        match session.execute(Command::TxnInfo).map_err(to_napi_err)? {
-            Output::TxnInfo(Some(info)) => Ok(serde_json::json!({
-                "id": info.id,
-                "status": format!("{:?}", info.status).to_lowercase(),
-                "startedAt": info.started_at,
-            })),
-            Output::TxnInfo(None) => Ok(serde_json::Value::Null),
-            _ => Err(napi::Error::from_reason("Unexpected output for TxnInfo")),
-        }
+    pub async fn txn_info(&self) -> napi::Result<serde_json::Value> {
+        let session_arc = self.session.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut session_ref = lock_session(&session_arc)?;
+            if session_ref.is_none() {
+                return Ok(serde_json::Value::Null);
+            }
+            let session = session_ref.as_mut().unwrap();
+            match session.execute(Command::TxnInfo).map_err(to_napi_err)? {
+                Output::TxnInfo(Some(info)) => Ok(serde_json::json!({
+                    "id": info.id,
+                    "status": format!("{:?}", info.status).to_lowercase(),
+                    "startedAt": info.started_at,
+                })),
+                Output::TxnInfo(None) => Ok(serde_json::Value::Null),
+                _ => Err(napi::Error::from_reason("Unexpected output for TxnInfo")),
+            }
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Check if a transaction is currently active.
     #[napi(js_name = "txnIsActive")]
-    pub fn txn_is_active(&self) -> napi::Result<bool> {
-        let mut session_ref = self.session.borrow_mut();
-        if session_ref.is_none() {
-            return Ok(false);
-        }
-        let session = session_ref.as_mut().unwrap();
-
-        match session.execute(Command::TxnIsActive).map_err(to_napi_err)? {
-            Output::Bool(active) => Ok(active),
-            _ => Err(napi::Error::from_reason("Unexpected output for TxnIsActive")),
-        }
+    pub async fn txn_is_active(&self) -> napi::Result<bool> {
+        let session_arc = self.session.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut session_ref = lock_session(&session_arc)?;
+            if session_ref.is_none() {
+                return Ok(false);
+            }
+            let session = session_ref.as_mut().unwrap();
+            match session.execute(Command::TxnIsActive).map_err(to_napi_err)? {
+                Output::Bool(active) => Ok(active),
+                _ => Err(napi::Error::from_reason(
+                    "Unexpected output for TxnIsActive",
+                )),
+            }
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     // =========================================================================
-    // Missing State Operations (MVP+1)
+    // State Operations
     // =========================================================================
 
     /// Delete a state cell.
-    ///
-    /// Returns true if the cell existed and was deleted, false otherwise.
     #[napi(js_name = "stateDelete")]
-    pub fn state_delete(&self, cell: String) -> napi::Result<bool> {
-        match self
-            .inner
-            .executor()
-            .execute(Command::StateDelete {
-                branch: None,
-                space: None,
-                cell,
-            })
-            .map_err(to_napi_err)?
-        {
-            Output::Bool(deleted) => Ok(deleted),
-            _ => Err(napi::Error::from_reason("Unexpected output for StateDelete")),
-        }
+    pub async fn state_delete(&self, cell: String) -> napi::Result<bool> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            match guard
+                .executor()
+                .execute(Command::StateDelete {
+                    branch: None,
+                    space: None,
+                    cell,
+                })
+                .map_err(to_napi_err)?
+            {
+                Output::Bool(deleted) => Ok(deleted),
+                _ => Err(napi::Error::from_reason("Unexpected output for StateDelete")),
+            }
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// List state cell names with optional prefix filter.
     #[napi(js_name = "stateList")]
-    pub fn state_list(&self, prefix: Option<String>) -> napi::Result<Vec<String>> {
-        match self
-            .inner
-            .executor()
-            .execute(Command::StateList {
-                branch: None,
-                space: None,
-                prefix,
-            })
-            .map_err(to_napi_err)?
-        {
-            Output::Keys(keys) => Ok(keys),
-            _ => Err(napi::Error::from_reason("Unexpected output for StateList")),
-        }
+    pub async fn state_list(&self, prefix: Option<String>) -> napi::Result<Vec<String>> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            match guard
+                .executor()
+                .execute(Command::StateList {
+                    branch: None,
+                    space: None,
+                    prefix,
+                })
+                .map_err(to_napi_err)?
+            {
+                Output::Keys(keys) => Ok(keys),
+                _ => Err(napi::Error::from_reason("Unexpected output for StateList")),
+            }
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     // =========================================================================
-    // Versioned Getters (MVP+1)
+    // Versioned Getters
     // =========================================================================
 
     /// Get a value by key with version info.
-    ///
-    /// Returns an object with 'value', 'version', 'timestamp', or null if key doesn't exist.
     #[napi(js_name = "kvGetVersioned")]
-    pub fn kv_get_versioned(&self, key: String) -> napi::Result<serde_json::Value> {
-        match self.inner.kv_getv(&key).map_err(to_napi_err)? {
-            Some(versions) if !versions.is_empty() => {
-                Ok(versioned_to_js(versions.into_iter().next().unwrap()))
+    pub async fn kv_get_versioned(&self, key: String) -> napi::Result<serde_json::Value> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            match guard.kv_getv(&key).map_err(to_napi_err)? {
+                Some(versions) if !versions.is_empty() => {
+                    Ok(versioned_to_js(versions.into_iter().next().unwrap()))
+                }
+                _ => Ok(serde_json::Value::Null),
             }
-            _ => Ok(serde_json::Value::Null),
-        }
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Get a state cell value with version info.
-    ///
-    /// Returns an object with 'value', 'version', 'timestamp', or null if cell doesn't exist.
     #[napi(js_name = "stateGetVersioned")]
-    pub fn state_get_versioned(&self, cell: String) -> napi::Result<serde_json::Value> {
-        match self.inner.state_getv(&cell).map_err(to_napi_err)? {
-            Some(versions) if !versions.is_empty() => {
-                Ok(versioned_to_js(versions.into_iter().next().unwrap()))
+    pub async fn state_get_versioned(&self, cell: String) -> napi::Result<serde_json::Value> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            match guard.state_getv(&cell).map_err(to_napi_err)? {
+                Some(versions) if !versions.is_empty() => {
+                    Ok(versioned_to_js(versions.into_iter().next().unwrap()))
+                }
+                _ => Ok(serde_json::Value::Null),
             }
-            _ => Ok(serde_json::Value::Null),
-        }
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Get a JSON document value with version info.
-    ///
-    /// Returns an object with 'value', 'version', 'timestamp', or null if key doesn't exist.
     #[napi(js_name = "jsonGetVersioned")]
-    pub fn json_get_versioned(&self, key: String) -> napi::Result<serde_json::Value> {
-        match self.inner.json_getv(&key).map_err(to_napi_err)? {
-            Some(versions) if !versions.is_empty() => {
-                Ok(versioned_to_js(versions.into_iter().next().unwrap()))
+    pub async fn json_get_versioned(&self, key: String) -> napi::Result<serde_json::Value> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            match guard.json_getv(&key).map_err(to_napi_err)? {
+                Some(versions) if !versions.is_empty() => {
+                    Ok(versioned_to_js(versions.into_iter().next().unwrap()))
+                }
+                _ => Ok(serde_json::Value::Null),
             }
-            _ => Ok(serde_json::Value::Null),
-        }
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     // =========================================================================
-    // Pagination Improvements (MVP+1)
+    // Pagination
     // =========================================================================
 
     /// List keys with pagination support.
-    ///
-    /// Returns an object with 'keys' array.
     #[napi(js_name = "kvListPaginated")]
-    pub fn kv_list_paginated(
+    pub async fn kv_list_paginated(
         &self,
         prefix: Option<String>,
         limit: Option<u32>,
-        cursor: Option<String>,
     ) -> napi::Result<serde_json::Value> {
-        match self
-            .inner
-            .executor()
-            .execute(Command::KvList {
-                branch: None,
-                space: None,
-                prefix,
-                cursor,
-                limit: limit.map(|l| l as u64),
-            })
-            .map_err(to_napi_err)?
-        {
-            Output::Keys(keys) => Ok(serde_json::json!({ "keys": keys })),
-            _ => Err(napi::Error::from_reason("Unexpected output for KvList")),
-        }
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            match guard
+                .executor()
+                .execute(Command::KvList {
+                    branch: None,
+                    space: None,
+                    prefix,
+                    cursor: None,
+                    limit: limit.map(|l| l as u64),
+                })
+                .map_err(to_napi_err)?
+            {
+                Output::Keys(keys) => Ok(serde_json::json!({ "keys": keys })),
+                _ => Err(napi::Error::from_reason("Unexpected output for KvList")),
+            }
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// List events by type with pagination support.
-    ///
-    /// Returns a list of event objects. Use `after` to paginate from a sequence number.
     #[napi(js_name = "eventListPaginated")]
-    pub fn event_list_paginated(
+    pub async fn event_list_paginated(
         &self,
         event_type: String,
         limit: Option<u32>,
-        after: Option<u32>,
+        after: Option<i64>,
     ) -> napi::Result<serde_json::Value> {
-        match self
-            .inner
-            .executor()
-            .execute(Command::EventGetByType {
-                branch: None,
-                space: None,
-                event_type,
-                limit: limit.map(|l| l as u64),
-                after_sequence: after.map(|a| a as u64),
-            })
-            .map_err(to_napi_err)?
-        {
-            Output::VersionedValues(events) => {
-                let arr: Vec<serde_json::Value> =
-                    events.into_iter().map(versioned_to_js).collect();
-                Ok(serde_json::Value::Array(arr))
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            match guard
+                .executor()
+                .execute(Command::EventGetByType {
+                    branch: None,
+                    space: None,
+                    event_type,
+                    limit: limit.map(|l| l as u64),
+                    after_sequence: after.map(|a| a as u64),
+                })
+                .map_err(to_napi_err)?
+            {
+                Output::VersionedValues(events) => {
+                    let arr: Vec<serde_json::Value> =
+                        events.into_iter().map(versioned_to_js).collect();
+                    Ok(serde_json::Value::Array(arr))
+                }
+                _ => Err(napi::Error::from_reason(
+                    "Unexpected output for EventGetByType",
+                )),
             }
-            _ => Err(napi::Error::from_reason(
-                "Unexpected output for EventGetByType",
-            )),
-        }
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     // =========================================================================
-    // Enhanced Vector Search (MVP+1)
+    // Enhanced Vector Search
     // =========================================================================
 
     /// Search for similar vectors with optional filter and metric override.
     #[napi(js_name = "vectorSearchFiltered")]
-    pub fn vector_search_filtered(
+    pub async fn vector_search_filtered(
         &self,
         collection: String,
         query: Vec<f64>,
@@ -1016,13 +1480,19 @@ impl Strata {
         metric: Option<String>,
         filter: Option<Vec<serde_json::Value>>,
     ) -> napi::Result<serde_json::Value> {
-        let vec: Vec<f32> = query.iter().map(|&f| f as f32).collect();
+        let inner = self.inner.clone();
+        let vec = validate_vector(&query)?;
 
         let metric_enum = match metric.as_deref() {
             Some("cosine") => Some(DistanceMetric::Cosine),
             Some("euclidean") => Some(DistanceMetric::Euclidean),
             Some("dot_product") | Some("dotproduct") => Some(DistanceMetric::DotProduct),
-            Some(m) => return Err(napi::Error::from_reason(format!("Invalid metric: {}", m))),
+            Some(m) => {
+                return Err(napi::Error::from_reason(format!(
+                    "[VALIDATION] Invalid metric: {}",
+                    m
+                )))
+            }
             None => None,
         };
 
@@ -1030,18 +1500,20 @@ impl Strata {
             Some(arr) => {
                 let mut filters = Vec::new();
                 for item in arr {
-                    let obj = item
-                        .as_object()
-                        .ok_or_else(|| napi::Error::from_reason("Filter must be an object"))?;
+                    let obj = item.as_object().ok_or_else(|| {
+                        napi::Error::from_reason("[VALIDATION] Filter must be an object")
+                    })?;
                     let field = obj
                         .get("field")
                         .and_then(|f| f.as_str())
-                        .ok_or_else(|| napi::Error::from_reason("Filter missing 'field'"))?
+                        .ok_or_else(|| {
+                            napi::Error::from_reason("[VALIDATION] Filter missing 'field'")
+                        })?
                         .to_string();
-                    let op_str = obj
-                        .get("op")
-                        .and_then(|o| o.as_str())
-                        .ok_or_else(|| napi::Error::from_reason("Filter missing 'op'"))?;
+                    let op_str =
+                        obj.get("op").and_then(|o| o.as_str()).ok_or_else(|| {
+                            napi::Error::from_reason("[VALIDATION] Filter missing 'op'")
+                        })?;
                     let op = match op_str {
                         "eq" => FilterOp::Eq,
                         "ne" => FilterOp::Ne,
@@ -1053,16 +1525,15 @@ impl Strata {
                         "contains" => FilterOp::Contains,
                         _ => {
                             return Err(napi::Error::from_reason(format!(
-                                "Invalid filter op: {}",
+                                "[VALIDATION] Invalid filter op: {}",
                                 op_str
                             )))
                         }
                     };
-                    let value_json = obj
-                        .get("value")
-                        .ok_or_else(|| napi::Error::from_reason("Filter missing 'value'"))?
-                        .clone();
-                    let value = js_to_value(value_json);
+                    let value_json = obj.get("value").ok_or_else(|| {
+                        napi::Error::from_reason("[VALIDATION] Filter missing 'value'")
+                    })?.clone();
+                    let value = js_to_value_checked(value_json, 0)?;
                     filters.push(MetadataFilter { field, op, value });
                 }
                 Some(filters)
@@ -1070,132 +1541,172 @@ impl Strata {
             None => None,
         };
 
-        match self
-            .inner
-            .executor()
-            .execute(Command::VectorSearch {
-                branch: None,
-                space: None,
-                collection,
-                query: vec,
-                k: k as u64,
-                filter: filter_vec,
-                metric: metric_enum,
-            })
-            .map_err(to_napi_err)?
-        {
-            Output::VectorMatches(matches) => {
-                let arr: Vec<serde_json::Value> = matches
-                    .into_iter()
-                    .map(|m| {
-                        serde_json::json!({
-                            "key": m.key,
-                            "score": m.score,
-                            "metadata": m.metadata.map(value_to_js),
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            match guard
+                .executor()
+                .execute(Command::VectorSearch {
+                    branch: None,
+                    space: None,
+                    collection,
+                    query: vec,
+                    k: k as u64,
+                    filter: filter_vec,
+                    metric: metric_enum,
+                })
+                .map_err(to_napi_err)?
+            {
+                Output::VectorMatches(matches) => {
+                    let arr: Vec<serde_json::Value> = matches
+                        .into_iter()
+                        .map(|m| {
+                            serde_json::json!({
+                                "key": m.key,
+                                "score": m.score,
+                                "metadata": m.metadata.map(value_to_js),
+                            })
                         })
-                    })
-                    .collect();
-                Ok(serde_json::Value::Array(arr))
+                        .collect();
+                    Ok(serde_json::Value::Array(arr))
+                }
+                _ => Err(napi::Error::from_reason(
+                    "Unexpected output for VectorSearch",
+                )),
             }
-            _ => Err(napi::Error::from_reason(
-                "Unexpected output for VectorSearch",
-            )),
-        }
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     // =========================================================================
-    // Space Operations (MVP+1)
+    // Space Operations
     // =========================================================================
 
     /// Create a new space explicitly.
-    ///
-    /// Spaces are auto-created on first write, but this allows pre-creation.
     #[napi(js_name = "spaceCreate")]
-    pub fn space_create(&self, space: String) -> napi::Result<()> {
-        match self
-            .inner
-            .executor()
-            .execute(Command::SpaceCreate {
-                branch: None,
-                space,
-            })
-            .map_err(to_napi_err)?
-        {
-            Output::Unit => Ok(()),
-            _ => Err(napi::Error::from_reason("Unexpected output for SpaceCreate")),
-        }
+    pub async fn space_create(&self, space: String) -> napi::Result<()> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            match guard
+                .executor()
+                .execute(Command::SpaceCreate {
+                    branch: None,
+                    space,
+                })
+                .map_err(to_napi_err)?
+            {
+                Output::Unit => Ok(()),
+                _ => Err(napi::Error::from_reason("Unexpected output for SpaceCreate")),
+            }
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     /// Check if a space exists in the current branch.
     #[napi(js_name = "spaceExists")]
-    pub fn space_exists(&self, space: String) -> napi::Result<bool> {
-        match self
-            .inner
-            .executor()
-            .execute(Command::SpaceExists {
-                branch: None,
-                space,
-            })
-            .map_err(to_napi_err)?
-        {
-            Output::Bool(exists) => Ok(exists),
-            _ => Err(napi::Error::from_reason("Unexpected output for SpaceExists")),
-        }
+    pub async fn space_exists(&self, space: String) -> napi::Result<bool> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            match guard
+                .executor()
+                .execute(Command::SpaceExists {
+                    branch: None,
+                    space,
+                })
+                .map_err(to_napi_err)?
+            {
+                Output::Bool(exists) => Ok(exists),
+                _ => Err(napi::Error::from_reason(
+                    "Unexpected output for SpaceExists",
+                )),
+            }
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
     // =========================================================================
-    // Search (MVP+1)
+    // Search
     // =========================================================================
 
     /// Search across multiple primitives for matching content.
-    ///
-    /// Returns a list of objects with 'entity', 'primitive', 'score', 'rank', 'snippet'.
     #[napi]
-    pub fn search(
+    pub async fn search(
         &self,
         query: String,
         k: Option<u32>,
         primitives: Option<Vec<String>>,
     ) -> napi::Result<serde_json::Value> {
-        match self
-            .inner
-            .executor()
-            .execute(Command::Search {
-                branch: None,
-                space: None,
-                query,
-                k: k.map(|n| n as u64),
-                primitives,
-            })
-            .map_err(to_napi_err)?
-        {
-            Output::SearchResults(results) => {
-                let arr: Vec<serde_json::Value> = results
-                    .into_iter()
-                    .map(|hit| {
-                        serde_json::json!({
-                            "entity": hit.entity,
-                            "primitive": hit.primitive,
-                            "score": hit.score,
-                            "rank": hit.rank,
-                            "snippet": hit.snippet,
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            match guard
+                .executor()
+                .execute(Command::Search {
+                    branch: None,
+                    space: None,
+                    query,
+                    k: k.map(|n| n as u64),
+                    primitives,
+                })
+                .map_err(to_napi_err)?
+            {
+                Output::SearchResults(results) => {
+                    let arr: Vec<serde_json::Value> = results
+                        .into_iter()
+                        .map(|hit| {
+                            serde_json::json!({
+                                "entity": hit.entity,
+                                "primitive": hit.primitive,
+                                "score": hit.score,
+                                "rank": hit.rank,
+                                "snippet": hit.snippet,
+                            })
                         })
-                    })
-                    .collect();
-                Ok(serde_json::Value::Array(arr))
+                        .collect();
+                    Ok(serde_json::Value::Array(arr))
+                }
+                _ => Err(napi::Error::from_reason("Unexpected output for Search")),
             }
-            _ => Err(napi::Error::from_reason("Unexpected output for Search")),
-        }
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
+    }
+
+    // =========================================================================
+    // Retention
+    // =========================================================================
+
+    /// Apply retention policy to trigger garbage collection.
+    #[napi(js_name = "retentionApply")]
+    pub async fn retention_apply(&self) -> napi::Result<()> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            match guard
+                .executor()
+                .execute(Command::RetentionApply { branch: None })
+                .map_err(to_napi_err)?
+            {
+                Output::Unit => Ok(()),
+                _ => Err(napi::Error::from_reason(
+                    "Unexpected output for RetentionApply",
+                )),
+            }
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 }
 
+// ---------------------------------------------------------------------------
+// Top-level functions
+// ---------------------------------------------------------------------------
+
 /// Download model files for auto-embedding.
-///
-/// Downloads MiniLM-L6-v2 model files to ~/.stratadb/models/minilm-l6-v2/.
-/// Called automatically when `autoEmbed` is true in `Strata.open()`, but can
-/// be called explicitly to pre-download (e.g., during npm install).
-///
-/// Returns the path where model files are stored.
 #[napi]
 pub fn setup() -> napi::Result<String> {
     #[cfg(feature = "embed")]
@@ -1213,7 +1724,10 @@ pub fn setup() -> napi::Result<String> {
     }
 }
 
-/// Convert CollectionInfo to JSON.
+// ---------------------------------------------------------------------------
+// Conversion helpers (free functions)
+// ---------------------------------------------------------------------------
+
 fn collection_info_to_js(c: CollectionInfo) -> serde_json::Value {
     serde_json::json!({
         "name": c.name,
@@ -1225,7 +1739,6 @@ fn collection_info_to_js(c: CollectionInfo) -> serde_json::Value {
     })
 }
 
-/// Convert VersionedBranchInfo to JSON.
 fn versioned_branch_info_to_js(info: VersionedBranchInfo) -> serde_json::Value {
     serde_json::json!({
         "id": info.info.id.as_str(),
@@ -1238,7 +1751,6 @@ fn versioned_branch_info_to_js(info: VersionedBranchInfo) -> serde_json::Value {
     })
 }
 
-/// Convert BranchExportResult to JSON.
 fn branch_export_result_to_js(r: BranchExportResult) -> serde_json::Value {
     serde_json::json!({
         "branchId": r.branch_id,
@@ -1248,7 +1760,6 @@ fn branch_export_result_to_js(r: BranchExportResult) -> serde_json::Value {
     })
 }
 
-/// Convert BranchImportResult to JSON.
 fn branch_import_result_to_js(r: BranchImportResult) -> serde_json::Value {
     serde_json::json!({
         "branchId": r.branch_id,
@@ -1257,7 +1768,6 @@ fn branch_import_result_to_js(r: BranchImportResult) -> serde_json::Value {
     })
 }
 
-/// Convert BundleValidateResult to JSON.
 fn bundle_validate_result_to_js(r: BundleValidateResult) -> serde_json::Value {
     serde_json::json!({
         "branchId": r.branch_id,

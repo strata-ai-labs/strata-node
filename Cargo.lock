@@ -950,6 +950,7 @@ dependencies = [
  "serde_json",
  "strata-intelligence",
  "stratadb",
+ "tokio",
 ]
 
 [[package]]
