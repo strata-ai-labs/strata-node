@@ -26,18 +26,21 @@ export declare class Strata {
   static cache(): Strata
   /** Store a key-value pair. */
   kvPut(key: string, value: any): Promise<number>
-  /** Get a value by key. */
-  kvGet(key: string): Promise<any>
+  /**
+   * Get a value by key. Optionally pass `asOf` (microseconds since epoch)
+   * to read as of a past timestamp.
+   */
+  kvGet(key: string, asOf?: number | undefined | null): Promise<any>
   /** Delete a key. */
   kvDelete(key: string): Promise<boolean>
-  /** List keys with optional prefix filter. */
-  kvList(prefix?: string | undefined | null): Promise<Array<string>>
+  /** List keys with optional prefix filter. Optionally pass `asOf` for time-travel. */
+  kvList(prefix?: string | undefined | null, asOf?: number | undefined | null): Promise<Array<string>>
   /** Get version history for a key. */
   kvHistory(key: string): Promise<any>
   /** Set a state cell value. */
   stateSet(cell: string, value: any): Promise<number>
-  /** Get a state cell value. */
-  stateGet(cell: string): Promise<any>
+  /** Get a state cell value. Optionally pass `asOf` for time-travel. */
+  stateGet(cell: string, asOf?: number | undefined | null): Promise<any>
   /** Initialize a state cell if it doesn't exist. */
   stateInit(cell: string, value: any): Promise<number>
   /** Compare-and-swap update based on version. */
@@ -46,22 +49,22 @@ export declare class Strata {
   stateHistory(cell: string): Promise<any>
   /** Append an event to the log. */
   eventAppend(eventType: string, payload: any): Promise<number>
-  /** Get an event by sequence number. */
-  eventGet(sequence: number): Promise<any>
-  /** List events by type. */
-  eventList(eventType: string): Promise<any>
+  /** Get an event by sequence number. Optionally pass `asOf` for time-travel. */
+  eventGet(sequence: number, asOf?: number | undefined | null): Promise<any>
+  /** List events by type. Optionally pass `asOf` for time-travel. */
+  eventList(eventType: string, asOf?: number | undefined | null): Promise<any>
   /** Get total event count. */
   eventLen(): Promise<number>
   /** Set a value at a JSONPath. */
   jsonSet(key: string, path: string, value: any): Promise<number>
-  /** Get a value at a JSONPath. */
-  jsonGet(key: string, path: string): Promise<any>
+  /** Get a value at a JSONPath. Optionally pass `asOf` for time-travel. */
+  jsonGet(key: string, path: string, asOf?: number | undefined | null): Promise<any>
   /** Delete a JSON document. */
   jsonDelete(key: string, path: string): Promise<number>
   /** Get version history for a JSON document. */
   jsonHistory(key: string): Promise<any>
-  /** List JSON document keys. */
-  jsonList(limit: number, prefix?: string | undefined | null, cursor?: string | undefined | null): Promise<any>
+  /** List JSON document keys. Optionally pass `asOf` for time-travel. */
+  jsonList(limit: number, prefix?: string | undefined | null, cursor?: string | undefined | null, asOf?: number | undefined | null): Promise<any>
   /** Create a vector collection. */
   vectorCreateCollection(collection: string, dimension: number, metric?: string | undefined | null): Promise<number>
   /** Delete a vector collection. */
@@ -70,12 +73,12 @@ export declare class Strata {
   vectorListCollections(): Promise<any>
   /** Insert or update a vector. */
   vectorUpsert(collection: string, key: string, vector: Array<number>, metadata?: any | undefined | null): Promise<number>
-  /** Get a vector by key. */
-  vectorGet(collection: string, key: string): Promise<any>
+  /** Get a vector by key. Optionally pass `asOf` for time-travel. */
+  vectorGet(collection: string, key: string, asOf?: number | undefined | null): Promise<any>
   /** Delete a vector. */
   vectorDelete(collection: string, key: string): Promise<boolean>
-  /** Search for similar vectors. */
-  vectorSearch(collection: string, query: Array<number>, k: number): Promise<any>
+  /** Search for similar vectors. Optionally pass `asOf` for time-travel. */
+  vectorSearch(collection: string, query: Array<number>, k: number, asOf?: number | undefined | null): Promise<any>
   /** Get statistics for a single collection. */
   vectorCollectionStats(collection: string): Promise<any>
   /** Batch insert/update multiple vectors. */
@@ -136,20 +139,23 @@ export declare class Strata {
   txnIsActive(): Promise<boolean>
   /** Delete a state cell. */
   stateDelete(cell: string): Promise<boolean>
-  /** List state cell names with optional prefix filter. */
-  stateList(prefix?: string | undefined | null): Promise<Array<string>>
+  /** List state cell names with optional prefix filter. Optionally pass `asOf` for time-travel. */
+  stateList(prefix?: string | undefined | null, asOf?: number | undefined | null): Promise<Array<string>>
   /** Get a value by key with version info. */
   kvGetVersioned(key: string): Promise<any>
   /** Get a state cell value with version info. */
   stateGetVersioned(cell: string): Promise<any>
   /** Get a JSON document value with version info. */
   jsonGetVersioned(key: string): Promise<any>
-  /** List keys with pagination support. */
-  kvListPaginated(prefix?: string | undefined | null, limit?: number | undefined | null): Promise<any>
-  /** List events by type with pagination support. */
-  eventListPaginated(eventType: string, limit?: number | undefined | null, after?: number | undefined | null): Promise<any>
-  /** Search for similar vectors with optional filter and metric override. */
-  vectorSearchFiltered(collection: string, query: Array<number>, k: number, metric?: string | undefined | null, filter?: Array<any> | undefined | null): Promise<any>
+  /** List keys with pagination support. Optionally pass `asOf` for time-travel. */
+  kvListPaginated(prefix?: string | undefined | null, limit?: number | undefined | null, asOf?: number | undefined | null): Promise<any>
+  /** List events by type with pagination support. Optionally pass `asOf` for time-travel. */
+  eventListPaginated(eventType: string, limit?: number | undefined | null, after?: number | undefined | null, asOf?: number | undefined | null): Promise<any>
+  /**
+   * Search for similar vectors with optional filter and metric override.
+   * Optionally pass `asOf` for time-travel.
+   */
+  vectorSearchFiltered(collection: string, query: Array<number>, k: number, metric?: string | undefined | null, filter?: Array<any> | undefined | null, asOf?: number | undefined | null): Promise<any>
   /** Create a new space explicitly. */
   spaceCreate(space: string): Promise<void>
   /** Check if a space exists in the current branch. */
@@ -158,4 +164,6 @@ export declare class Strata {
   search(query: string, k?: number | undefined | null, primitives?: Array<string> | undefined | null): Promise<any>
   /** Apply retention policy to trigger garbage collection. */
   retentionApply(): Promise<void>
+  /** Get the time range (oldest and latest timestamps) for the current branch. */
+  timeRange(): Promise<any>
 }

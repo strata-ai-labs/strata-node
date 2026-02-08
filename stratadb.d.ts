@@ -185,6 +185,12 @@ export interface SearchHit {
   snippet?: string;
 }
 
+/** Time range for a branch */
+export interface TimeRange {
+  oldestTs: number | null;
+  latestTs: number | null;
+}
+
 /** Options for opening a database */
 export interface OpenOptions {
   /** Enable automatic text embedding for semantic search. */
@@ -206,36 +212,36 @@ export class Strata {
 
   // KV Store
   kvPut(key: string, value: JsonValue): Promise<number>;
-  kvGet(key: string): Promise<JsonValue>;
+  kvGet(key: string, asOf?: number): Promise<JsonValue>;
   kvDelete(key: string): Promise<boolean>;
-  kvList(prefix?: string): Promise<string[]>;
+  kvList(prefix?: string, asOf?: number): Promise<string[]>;
   kvHistory(key: string): Promise<VersionedValue[] | null>;
   kvGetVersioned(key: string): Promise<VersionedValue | null>;
-  kvListPaginated(prefix?: string, limit?: number): Promise<KvListResult>;
+  kvListPaginated(prefix?: string, limit?: number, asOf?: number): Promise<KvListResult>;
 
   // State Cell
   stateSet(cell: string, value: JsonValue): Promise<number>;
-  stateGet(cell: string): Promise<JsonValue>;
+  stateGet(cell: string, asOf?: number): Promise<JsonValue>;
   stateInit(cell: string, value: JsonValue): Promise<number>;
   stateCas(cell: string, newValue: JsonValue, expectedVersion?: number): Promise<number | null>;
   stateHistory(cell: string): Promise<VersionedValue[] | null>;
   stateDelete(cell: string): Promise<boolean>;
-  stateList(prefix?: string): Promise<string[]>;
+  stateList(prefix?: string, asOf?: number): Promise<string[]>;
   stateGetVersioned(cell: string): Promise<VersionedValue | null>;
 
   // Event Log
   eventAppend(eventType: string, payload: JsonValue): Promise<number>;
-  eventGet(sequence: number): Promise<VersionedValue | null>;
-  eventList(eventType: string): Promise<VersionedValue[]>;
+  eventGet(sequence: number, asOf?: number): Promise<VersionedValue | null>;
+  eventList(eventType: string, asOf?: number): Promise<VersionedValue[]>;
   eventLen(): Promise<number>;
-  eventListPaginated(eventType: string, limit?: number, after?: number): Promise<VersionedValue[]>;
+  eventListPaginated(eventType: string, limit?: number, after?: number, asOf?: number): Promise<VersionedValue[]>;
 
   // JSON Store
   jsonSet(key: string, path: string, value: JsonValue): Promise<number>;
-  jsonGet(key: string, path: string): Promise<JsonValue>;
+  jsonGet(key: string, path: string, asOf?: number): Promise<JsonValue>;
   jsonDelete(key: string, path: string): Promise<number>;
   jsonHistory(key: string): Promise<VersionedValue[] | null>;
-  jsonList(limit: number, prefix?: string, cursor?: string): Promise<JsonListResult>;
+  jsonList(limit: number, prefix?: string, cursor?: string, asOf?: number): Promise<JsonListResult>;
   jsonGetVersioned(key: string): Promise<VersionedValue | null>;
 
   // Vector Store
@@ -243,9 +249,9 @@ export class Strata {
   vectorDeleteCollection(collection: string): Promise<boolean>;
   vectorListCollections(): Promise<CollectionInfo[]>;
   vectorUpsert(collection: string, key: string, vector: number[], metadata?: JsonValue): Promise<number>;
-  vectorGet(collection: string, key: string): Promise<VectorData | null>;
+  vectorGet(collection: string, key: string, asOf?: number): Promise<VectorData | null>;
   vectorDelete(collection: string, key: string): Promise<boolean>;
-  vectorSearch(collection: string, query: number[], k: number): Promise<SearchMatch[]>;
+  vectorSearch(collection: string, query: number[], k: number, asOf?: number): Promise<SearchMatch[]>;
   vectorCollectionStats(collection: string): Promise<CollectionInfo>;
   vectorBatchUpsert(collection: string, vectors: BatchVectorEntry[]): Promise<number[]>;
   vectorSearchFiltered(
@@ -254,6 +260,7 @@ export class Strata {
     k: number,
     metric?: string,
     filter?: MetadataFilter[],
+    asOf?: number,
   ): Promise<SearchMatch[]>;
 
   // Branch Management
@@ -300,6 +307,9 @@ export class Strata {
 
   // Retention
   retentionApply(): Promise<void>;
+
+  // Time Travel
+  timeRange(): Promise<TimeRange>;
 }
 
 /**

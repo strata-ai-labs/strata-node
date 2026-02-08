@@ -11,10 +11,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use stratadb::{
-    AccessMode, BatchVectorEntry, BranchExportResult, BranchImportResult, BundleValidateResult,
-    CollectionInfo, Command, DistanceMetric, Error as StrataError, FilterOp, MergeStrategy,
-    MetadataFilter, OpenOptions, Output, Session, Strata as RustStrata, TxnOptions, Value,
-    VersionedBranchInfo, VersionedValue,
+    AccessMode, BatchVectorEntry, BranchExportResult, BranchId, BranchImportResult,
+    BundleValidateResult, CollectionInfo, Command, DistanceMetric, Error as StrataError, FilterOp,
+    MergeStrategy, MetadataFilter, OpenOptions, Output, Session, Strata as RustStrata, TxnOptions,
+    Value, VersionedBranchInfo, VersionedValue,
 };
 
 /// Maximum nesting depth for JSON → Value conversion.
@@ -189,6 +189,7 @@ fn to_napi_err(e: StrataError) -> napi::Error {
         StrataError::DimensionMismatch { .. }
         | StrataError::ConstraintViolation { .. }
         | StrataError::HistoryTrimmed { .. }
+        | StrataError::HistoryUnavailable { .. }
         | StrataError::Overflow { .. } => "[CONSTRAINT]",
 
         StrataError::AccessDenied { .. } => "[ACCESS_DENIED]",
@@ -294,15 +295,31 @@ impl Strata {
         .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
-    /// Get a value by key.
+    /// Get a value by key. Optionally pass `asOf` (microseconds since epoch)
+    /// to read as of a past timestamp.
     #[napi(js_name = "kvGet")]
-    pub async fn kv_get(&self, key: String) -> napi::Result<serde_json::Value> {
+    pub async fn kv_get(&self, key: String, as_of: Option<i64>) -> napi::Result<serde_json::Value> {
         let inner = self.inner.clone();
+        let as_of_u64 = as_of.map(|t| t as u64);
         tokio::task::spawn_blocking(move || {
             let guard = lock_inner(&inner)?;
-            match guard.kv_get(&key).map_err(to_napi_err)? {
-                Some(v) => Ok(value_to_js(v)),
-                None => Ok(serde_json::Value::Null),
+            let branch = Some(BranchId::from(guard.current_branch()));
+            let space = Some(guard.current_space().to_string());
+            match guard
+                .executor()
+                .execute(Command::KvGet {
+                    branch,
+                    space,
+                    key,
+                    as_of: as_of_u64,
+                })
+                .map_err(to_napi_err)?
+            {
+                Output::MaybeVersioned(Some(vv)) => Ok(value_to_js(vv.value)),
+                Output::MaybeVersioned(None) => Ok(serde_json::Value::Null),
+                Output::Maybe(Some(v)) => Ok(value_to_js(v)),
+                Output::Maybe(None) => Ok(serde_json::Value::Null),
+                _ => Err(napi::Error::from_reason("Unexpected output for KvGet")),
             }
         })
         .await
@@ -321,13 +338,34 @@ impl Strata {
         .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
-    /// List keys with optional prefix filter.
+    /// List keys with optional prefix filter. Optionally pass `asOf` for time-travel.
     #[napi(js_name = "kvList")]
-    pub async fn kv_list(&self, prefix: Option<String>) -> napi::Result<Vec<String>> {
+    pub async fn kv_list(
+        &self,
+        prefix: Option<String>,
+        as_of: Option<i64>,
+    ) -> napi::Result<Vec<String>> {
         let inner = self.inner.clone();
+        let as_of_u64 = as_of.map(|t| t as u64);
         tokio::task::spawn_blocking(move || {
             let guard = lock_inner(&inner)?;
-            guard.kv_list(prefix.as_deref()).map_err(to_napi_err)
+            let branch = Some(BranchId::from(guard.current_branch()));
+            let space = Some(guard.current_space().to_string());
+            match guard
+                .executor()
+                .execute(Command::KvList {
+                    branch,
+                    space,
+                    prefix,
+                    cursor: None,
+                    limit: None,
+                    as_of: as_of_u64,
+                })
+                .map_err(to_napi_err)?
+            {
+                Output::Keys(keys) => Ok(keys),
+                _ => Err(napi::Error::from_reason("Unexpected output for KvList")),
+            }
         })
         .await
         .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
@@ -372,15 +410,34 @@ impl Strata {
         .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
-    /// Get a state cell value.
+    /// Get a state cell value. Optionally pass `asOf` for time-travel.
     #[napi(js_name = "stateGet")]
-    pub async fn state_get(&self, cell: String) -> napi::Result<serde_json::Value> {
+    pub async fn state_get(
+        &self,
+        cell: String,
+        as_of: Option<i64>,
+    ) -> napi::Result<serde_json::Value> {
         let inner = self.inner.clone();
+        let as_of_u64 = as_of.map(|t| t as u64);
         tokio::task::spawn_blocking(move || {
             let guard = lock_inner(&inner)?;
-            match guard.state_get(&cell).map_err(to_napi_err)? {
-                Some(v) => Ok(value_to_js(v)),
-                None => Ok(serde_json::Value::Null),
+            let branch = Some(BranchId::from(guard.current_branch()));
+            let space = Some(guard.current_space().to_string());
+            match guard
+                .executor()
+                .execute(Command::StateGet {
+                    branch,
+                    space,
+                    cell,
+                    as_of: as_of_u64,
+                })
+                .map_err(to_napi_err)?
+            {
+                Output::MaybeVersioned(Some(vv)) => Ok(value_to_js(vv.value)),
+                Output::MaybeVersioned(None) => Ok(serde_json::Value::Null),
+                Output::Maybe(Some(v)) => Ok(value_to_js(v)),
+                Output::Maybe(None) => Ok(serde_json::Value::Null),
+                _ => Err(napi::Error::from_reason("Unexpected output for StateGet")),
             }
         })
         .await
@@ -468,30 +525,74 @@ impl Strata {
         .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
-    /// Get an event by sequence number.
+    /// Get an event by sequence number. Optionally pass `asOf` for time-travel.
     #[napi(js_name = "eventGet")]
-    pub async fn event_get(&self, sequence: i64) -> napi::Result<serde_json::Value> {
+    pub async fn event_get(
+        &self,
+        sequence: i64,
+        as_of: Option<i64>,
+    ) -> napi::Result<serde_json::Value> {
         let inner = self.inner.clone();
+        let as_of_u64 = as_of.map(|t| t as u64);
         tokio::task::spawn_blocking(move || {
             let guard = lock_inner(&inner)?;
-            match guard.event_get(sequence as u64).map_err(to_napi_err)? {
-                Some(vv) => Ok(versioned_to_js(vv)),
-                None => Ok(serde_json::Value::Null),
+            let branch = Some(BranchId::from(guard.current_branch()));
+            let space = Some(guard.current_space().to_string());
+            match guard
+                .executor()
+                .execute(Command::EventGet {
+                    branch,
+                    space,
+                    sequence: sequence as u64,
+                    as_of: as_of_u64,
+                })
+                .map_err(to_napi_err)?
+            {
+                Output::MaybeVersioned(Some(vv)) => Ok(versioned_to_js(vv)),
+                Output::MaybeVersioned(None) => Ok(serde_json::Value::Null),
+                Output::Maybe(Some(v)) => Ok(serde_json::json!({ "value": value_to_js(v) })),
+                Output::Maybe(None) => Ok(serde_json::Value::Null),
+                _ => Err(napi::Error::from_reason("Unexpected output for EventGet")),
             }
         })
         .await
         .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
-    /// List events by type.
+    /// List events by type. Optionally pass `asOf` for time-travel.
     #[napi(js_name = "eventList")]
-    pub async fn event_list(&self, event_type: String) -> napi::Result<serde_json::Value> {
+    pub async fn event_list(
+        &self,
+        event_type: String,
+        as_of: Option<i64>,
+    ) -> napi::Result<serde_json::Value> {
         let inner = self.inner.clone();
+        let as_of_u64 = as_of.map(|t| t as u64);
         tokio::task::spawn_blocking(move || {
             let guard = lock_inner(&inner)?;
-            let events = guard.event_get_by_type(&event_type).map_err(to_napi_err)?;
-            let arr: Vec<serde_json::Value> = events.into_iter().map(versioned_to_js).collect();
-            Ok(serde_json::Value::Array(arr))
+            let branch = Some(BranchId::from(guard.current_branch()));
+            let space = Some(guard.current_space().to_string());
+            match guard
+                .executor()
+                .execute(Command::EventGetByType {
+                    branch,
+                    space,
+                    event_type,
+                    limit: None,
+                    after_sequence: None,
+                    as_of: as_of_u64,
+                })
+                .map_err(to_napi_err)?
+            {
+                Output::VersionedValues(events) => {
+                    let arr: Vec<serde_json::Value> =
+                        events.into_iter().map(versioned_to_js).collect();
+                    Ok(serde_json::Value::Array(arr))
+                }
+                _ => Err(napi::Error::from_reason(
+                    "Unexpected output for EventGetByType",
+                )),
+            }
         })
         .await
         .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
@@ -534,15 +635,36 @@ impl Strata {
         .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
-    /// Get a value at a JSONPath.
+    /// Get a value at a JSONPath. Optionally pass `asOf` for time-travel.
     #[napi(js_name = "jsonGet")]
-    pub async fn json_get(&self, key: String, path: String) -> napi::Result<serde_json::Value> {
+    pub async fn json_get(
+        &self,
+        key: String,
+        path: String,
+        as_of: Option<i64>,
+    ) -> napi::Result<serde_json::Value> {
         let inner = self.inner.clone();
+        let as_of_u64 = as_of.map(|t| t as u64);
         tokio::task::spawn_blocking(move || {
             let guard = lock_inner(&inner)?;
-            match guard.json_get(&key, &path).map_err(to_napi_err)? {
-                Some(v) => Ok(value_to_js(v)),
-                None => Ok(serde_json::Value::Null),
+            let branch = Some(BranchId::from(guard.current_branch()));
+            let space = Some(guard.current_space().to_string());
+            match guard
+                .executor()
+                .execute(Command::JsonGet {
+                    branch,
+                    space,
+                    key,
+                    path,
+                    as_of: as_of_u64,
+                })
+                .map_err(to_napi_err)?
+            {
+                Output::MaybeVersioned(Some(vv)) => Ok(value_to_js(vv.value)),
+                Output::MaybeVersioned(None) => Ok(serde_json::Value::Null),
+                Output::Maybe(Some(v)) => Ok(value_to_js(v)),
+                Output::Maybe(None) => Ok(serde_json::Value::Null),
+                _ => Err(napi::Error::from_reason("Unexpected output for JsonGet")),
             }
         })
         .await
@@ -583,24 +705,43 @@ impl Strata {
         .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
-    /// List JSON document keys.
+    /// List JSON document keys. Optionally pass `asOf` for time-travel.
     #[napi(js_name = "jsonList")]
     pub async fn json_list(
         &self,
         limit: u32,
         prefix: Option<String>,
         cursor: Option<String>,
+        as_of: Option<i64>,
     ) -> napi::Result<serde_json::Value> {
         let inner = self.inner.clone();
+        let as_of_u64 = as_of.map(|t| t as u64);
         tokio::task::spawn_blocking(move || {
             let guard = lock_inner(&inner)?;
-            let (keys, next_cursor) = guard
-                .json_list(prefix, cursor, limit as u64)
-                .map_err(to_napi_err)?;
-            Ok(serde_json::json!({
-                "keys": keys,
-                "cursor": next_cursor,
-            }))
+            let branch = Some(BranchId::from(guard.current_branch()));
+            let space = Some(guard.current_space().to_string());
+            match guard
+                .executor()
+                .execute(Command::JsonList {
+                    branch,
+                    space,
+                    prefix,
+                    cursor,
+                    limit: limit as u64,
+                    as_of: as_of_u64,
+                })
+                .map_err(to_napi_err)?
+            {
+                Output::JsonListResult { keys, cursor } => Ok(serde_json::json!({
+                    "keys": keys,
+                    "cursor": cursor,
+                })),
+                Output::Keys(keys) => Ok(serde_json::json!({
+                    "keys": keys,
+                    "cursor": serde_json::Value::Null,
+                })),
+                _ => Err(napi::Error::from_reason("Unexpected output for JsonList")),
+            }
         })
         .await
         .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
@@ -691,18 +832,32 @@ impl Strata {
         .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
-    /// Get a vector by key.
+    /// Get a vector by key. Optionally pass `asOf` for time-travel.
     #[napi(js_name = "vectorGet")]
     pub async fn vector_get(
         &self,
         collection: String,
         key: String,
+        as_of: Option<i64>,
     ) -> napi::Result<serde_json::Value> {
         let inner = self.inner.clone();
+        let as_of_u64 = as_of.map(|t| t as u64);
         tokio::task::spawn_blocking(move || {
             let guard = lock_inner(&inner)?;
-            match guard.vector_get(&collection, &key).map_err(to_napi_err)? {
-                Some(vd) => {
+            let branch = Some(BranchId::from(guard.current_branch()));
+            let space = Some(guard.current_space().to_string());
+            match guard
+                .executor()
+                .execute(Command::VectorGet {
+                    branch,
+                    space,
+                    collection,
+                    key,
+                    as_of: as_of_u64,
+                })
+                .map_err(to_napi_err)?
+            {
+                Output::VectorData(Some(vd)) => {
                     let embedding: Vec<f64> =
                         vd.data.embedding.iter().map(|&f| f as f64).collect();
                     Ok(serde_json::json!({
@@ -713,7 +868,8 @@ impl Strata {
                         "timestamp": vd.timestamp,
                     }))
                 }
-                None => Ok(serde_json::Value::Null),
+                Output::VectorData(None) => Ok(serde_json::Value::Null),
+                _ => Err(napi::Error::from_reason("Unexpected output for VectorGet")),
             }
         })
         .await
@@ -732,32 +888,53 @@ impl Strata {
         .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
-    /// Search for similar vectors.
+    /// Search for similar vectors. Optionally pass `asOf` for time-travel.
     #[napi(js_name = "vectorSearch")]
     pub async fn vector_search(
         &self,
         collection: String,
         query: Vec<f64>,
         k: u32,
+        as_of: Option<i64>,
     ) -> napi::Result<serde_json::Value> {
         let inner = self.inner.clone();
         let vec = validate_vector(&query)?;
+        let as_of_u64 = as_of.map(|t| t as u64);
         tokio::task::spawn_blocking(move || {
             let guard = lock_inner(&inner)?;
-            let matches = guard
-                .vector_search(&collection, vec, k as u64)
-                .map_err(to_napi_err)?;
-            let arr: Vec<serde_json::Value> = matches
-                .into_iter()
-                .map(|m| {
-                    serde_json::json!({
-                        "key": m.key,
-                        "score": m.score,
-                        "metadata": m.metadata.map(value_to_js),
-                    })
+            let branch = Some(BranchId::from(guard.current_branch()));
+            let space = Some(guard.current_space().to_string());
+            match guard
+                .executor()
+                .execute(Command::VectorSearch {
+                    branch,
+                    space,
+                    collection,
+                    query: vec,
+                    k: k as u64,
+                    filter: None,
+                    metric: None,
+                    as_of: as_of_u64,
                 })
-                .collect();
-            Ok(serde_json::Value::Array(arr))
+                .map_err(to_napi_err)?
+            {
+                Output::VectorMatches(matches) => {
+                    let arr: Vec<serde_json::Value> = matches
+                        .into_iter()
+                        .map(|m| {
+                            serde_json::json!({
+                                "key": m.key,
+                                "score": m.score,
+                                "metadata": m.metadata.map(value_to_js),
+                            })
+                        })
+                        .collect();
+                    Ok(serde_json::Value::Array(arr))
+                }
+                _ => Err(napi::Error::from_reason(
+                    "Unexpected output for VectorSearch",
+                )),
+            }
         })
         .await
         .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
@@ -1319,18 +1496,26 @@ impl Strata {
         .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
-    /// List state cell names with optional prefix filter.
+    /// List state cell names with optional prefix filter. Optionally pass `asOf` for time-travel.
     #[napi(js_name = "stateList")]
-    pub async fn state_list(&self, prefix: Option<String>) -> napi::Result<Vec<String>> {
+    pub async fn state_list(
+        &self,
+        prefix: Option<String>,
+        as_of: Option<i64>,
+    ) -> napi::Result<Vec<String>> {
         let inner = self.inner.clone();
+        let as_of_u64 = as_of.map(|t| t as u64);
         tokio::task::spawn_blocking(move || {
             let guard = lock_inner(&inner)?;
+            let branch = Some(BranchId::from(guard.current_branch()));
+            let space = Some(guard.current_space().to_string());
             match guard
                 .executor()
                 .execute(Command::StateList {
-                    branch: None,
-                    space: None,
+                    branch,
+                    space,
                     prefix,
+                    as_of: as_of_u64,
                 })
                 .map_err(to_napi_err)?
             {
@@ -1401,24 +1586,29 @@ impl Strata {
     // Pagination
     // =========================================================================
 
-    /// List keys with pagination support.
+    /// List keys with pagination support. Optionally pass `asOf` for time-travel.
     #[napi(js_name = "kvListPaginated")]
     pub async fn kv_list_paginated(
         &self,
         prefix: Option<String>,
         limit: Option<u32>,
+        as_of: Option<i64>,
     ) -> napi::Result<serde_json::Value> {
         let inner = self.inner.clone();
+        let as_of_u64 = as_of.map(|t| t as u64);
         tokio::task::spawn_blocking(move || {
             let guard = lock_inner(&inner)?;
+            let branch = Some(BranchId::from(guard.current_branch()));
+            let space = Some(guard.current_space().to_string());
             match guard
                 .executor()
                 .execute(Command::KvList {
-                    branch: None,
-                    space: None,
+                    branch,
+                    space,
                     prefix,
                     cursor: None,
                     limit: limit.map(|l| l as u64),
+                    as_of: as_of_u64,
                 })
                 .map_err(to_napi_err)?
             {
@@ -1430,25 +1620,30 @@ impl Strata {
         .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
     }
 
-    /// List events by type with pagination support.
+    /// List events by type with pagination support. Optionally pass `asOf` for time-travel.
     #[napi(js_name = "eventListPaginated")]
     pub async fn event_list_paginated(
         &self,
         event_type: String,
         limit: Option<u32>,
         after: Option<i64>,
+        as_of: Option<i64>,
     ) -> napi::Result<serde_json::Value> {
         let inner = self.inner.clone();
+        let as_of_u64 = as_of.map(|t| t as u64);
         tokio::task::spawn_blocking(move || {
             let guard = lock_inner(&inner)?;
+            let branch = Some(BranchId::from(guard.current_branch()));
+            let space = Some(guard.current_space().to_string());
             match guard
                 .executor()
                 .execute(Command::EventGetByType {
-                    branch: None,
-                    space: None,
+                    branch,
+                    space,
                     event_type,
                     limit: limit.map(|l| l as u64),
                     after_sequence: after.map(|a| a as u64),
+                    as_of: as_of_u64,
                 })
                 .map_err(to_napi_err)?
             {
@@ -1471,6 +1666,7 @@ impl Strata {
     // =========================================================================
 
     /// Search for similar vectors with optional filter and metric override.
+    /// Optionally pass `asOf` for time-travel.
     #[napi(js_name = "vectorSearchFiltered")]
     pub async fn vector_search_filtered(
         &self,
@@ -1479,6 +1675,7 @@ impl Strata {
         k: u32,
         metric: Option<String>,
         filter: Option<Vec<serde_json::Value>>,
+        as_of: Option<i64>,
     ) -> napi::Result<serde_json::Value> {
         let inner = self.inner.clone();
         let vec = validate_vector(&query)?;
@@ -1495,6 +1692,8 @@ impl Strata {
             }
             None => None,
         };
+
+        let as_of_u64 = as_of.map(|t| t as u64);
 
         let filter_vec = match filter {
             Some(arr) => {
@@ -1543,16 +1742,19 @@ impl Strata {
 
         tokio::task::spawn_blocking(move || {
             let guard = lock_inner(&inner)?;
+            let branch = Some(BranchId::from(guard.current_branch()));
+            let space = Some(guard.current_space().to_string());
             match guard
                 .executor()
                 .execute(Command::VectorSearch {
-                    branch: None,
-                    space: None,
+                    branch,
+                    space,
                     collection,
                     query: vec,
                     k: k as u64,
                     filter: filter_vec,
                     metric: metric_enum,
+                    as_of: as_of_u64,
                 })
                 .map_err(to_napi_err)?
             {
@@ -1694,6 +1896,38 @@ impl Strata {
                 Output::Unit => Ok(()),
                 _ => Err(napi::Error::from_reason(
                     "Unexpected output for RetentionApply",
+                )),
+            }
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
+    }
+
+    // =========================================================================
+    // Time Travel
+    // =========================================================================
+
+    /// Get the time range (oldest and latest timestamps) for the current branch.
+    #[napi(js_name = "timeRange")]
+    pub async fn time_range(&self) -> napi::Result<serde_json::Value> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            let branch = Some(BranchId::from(guard.current_branch()));
+            match guard
+                .executor()
+                .execute(Command::TimeRange { branch })
+                .map_err(to_napi_err)?
+            {
+                Output::TimeRange {
+                    oldest_ts,
+                    latest_ts,
+                } => Ok(serde_json::json!({
+                    "oldestTs": oldest_ts.map(|t| t as i64),
+                    "latestTs": latest_ts.map(|t| t as i64),
+                })),
+                _ => Err(napi::Error::from_reason(
+                    "Unexpected output for TimeRange",
                 )),
             }
         })

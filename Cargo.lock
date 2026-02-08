@@ -238,6 +238,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -804,7 +814,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 [[package]]
 name = "strata-concurrency"
 version = "0.5.1"
-source = "git+https://github.com/stratadb-labs/strata-core?branch=main#b403f388220efcd395c9cb5172235d473af23bd4"
+source = "git+https://github.com/stratadb-labs/strata-core?branch=main#6c2475fc3502d280e9b4eb3f98fa42d0de88cdbd"
 dependencies = [
  "chrono",
  "dashmap",
@@ -821,7 +831,7 @@ dependencies = [
 [[package]]
 name = "strata-core"
 version = "0.5.1"
-source = "git+https://github.com/stratadb-labs/strata-core?branch=main#b403f388220efcd395c9cb5172235d473af23bd4"
+source = "git+https://github.com/stratadb-labs/strata-core?branch=main#6c2475fc3502d280e9b4eb3f98fa42d0de88cdbd"
 dependencies = [
  "bincode",
  "chrono",
@@ -834,7 +844,7 @@ dependencies = [
 [[package]]
 name = "strata-durability"
 version = "0.5.1"
-source = "git+https://github.com/stratadb-labs/strata-core?branch=main#b403f388220efcd395c9cb5172235d473af23bd4"
+source = "git+https://github.com/stratadb-labs/strata-core?branch=main#6c2475fc3502d280e9b4eb3f98fa42d0de88cdbd"
 dependencies = [
  "crc32fast",
  "parking_lot",
@@ -853,11 +863,12 @@ dependencies = [
 [[package]]
 name = "strata-engine"
 version = "0.5.1"
-source = "git+https://github.com/stratadb-labs/strata-core?branch=main#b403f388220efcd395c9cb5172235d473af23bd4"
+source = "git+https://github.com/stratadb-labs/strata-core?branch=main#6c2475fc3502d280e9b4eb3f98fa42d0de88cdbd"
 dependencies = [
  "base64 0.21.7",
  "byteorder",
  "dashmap",
+ "fs2",
  "once_cell",
  "parking_lot",
  "rmp-serde",
@@ -877,7 +888,7 @@ dependencies = [
 [[package]]
 name = "strata-executor"
 version = "0.5.1"
-source = "git+https://github.com/stratadb-labs/strata-core?branch=main#b403f388220efcd395c9cb5172235d473af23bd4"
+source = "git+https://github.com/stratadb-labs/strata-core?branch=main#6c2475fc3502d280e9b4eb3f98fa42d0de88cdbd"
 dependencies = [
  "base64 0.21.7",
  "rmp-serde",
@@ -895,7 +906,7 @@ dependencies = [
 [[package]]
 name = "strata-intelligence"
 version = "0.5.1"
-source = "git+https://github.com/stratadb-labs/strata-core?branch=main#b403f388220efcd395c9cb5172235d473af23bd4"
+source = "git+https://github.com/stratadb-labs/strata-core?branch=main#6c2475fc3502d280e9b4eb3f98fa42d0de88cdbd"
 dependencies = [
  "dashmap",
  "once_cell",
@@ -912,7 +923,7 @@ dependencies = [
 [[package]]
 name = "strata-security"
 version = "0.5.1"
-source = "git+https://github.com/stratadb-labs/strata-core?branch=main#b403f388220efcd395c9cb5172235d473af23bd4"
+source = "git+https://github.com/stratadb-labs/strata-core?branch=main#6c2475fc3502d280e9b4eb3f98fa42d0de88cdbd"
 dependencies = [
  "serde",
 ]
@@ -920,7 +931,7 @@ dependencies = [
 [[package]]
 name = "strata-storage"
 version = "0.5.1"
-source = "git+https://github.com/stratadb-labs/strata-core?branch=main#b403f388220efcd395c9cb5172235d473af23bd4"
+source = "git+https://github.com/stratadb-labs/strata-core?branch=main#6c2475fc3502d280e9b4eb3f98fa42d0de88cdbd"
 dependencies = [
  "dashmap",
  "rustc-hash",
@@ -931,7 +942,7 @@ dependencies = [
 [[package]]
 name = "stratadb"
 version = "0.5.1"
-source = "git+https://github.com/stratadb-labs/strata-core?branch=main#b403f388220efcd395c9cb5172235d473af23bd4"
+source = "git+https://github.com/stratadb-labs/strata-core?branch=main#6c2475fc3502d280e9b4eb3f98fa42d0de88cdbd"
 dependencies = [
  "serde_json",
  "strata-executor",
@@ -941,7 +952,7 @@ dependencies = [
 
 [[package]]
 name = "stratadb-node"
-version = "0.6.0"
+version = "0.11.1"
 dependencies = [
  "napi",
  "napi-build",
@@ -1228,6 +1239,28 @@ checksum = "22cfaf3c063993ff62e73cb4311efde4db1efb31ab78a3e5c457939ad5cc0bed"
 dependencies = [
  "rustls-pki-types",
 ]
+
+[[package]]
+name = "winapi"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c839a674fcd7a98952e593242ea400abe93992746761e38641405d28b00f419"
+dependencies = [
+ "winapi-i686-pc-windows-gnu",
+ "winapi-x86_64-pc-windows-gnu",
+]
+
+[[package]]
+name = "winapi-i686-pc-windows-gnu"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
+
+[[package]]
+name = "winapi-x86_64-pc-windows-gnu"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "windows-core"

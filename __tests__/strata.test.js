@@ -534,6 +534,176 @@ describe('Strata', () => {
   });
 
   // =========================================================================
+  // Time Travel
+  // =========================================================================
+
+  describe('Time Travel', () => {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    test('kvGet with asOf returns past value', async () => {
+      await db.kvPut('tt_kv', 'v1');
+      await sleep(50);
+      const range = await db.timeRange();
+      const ts = range.latestTs;
+      await sleep(50);
+      await db.kvPut('tt_kv', 'v2');
+
+      expect(await db.kvGet('tt_kv')).toBe('v2');
+      expect(await db.kvGet('tt_kv', ts)).toBe('v1');
+    });
+
+    test('kvGet with asOf before creation returns null', async () => {
+      const range = await db.timeRange();
+      // Use timestamp 1 (before any writes)
+      const earlyTs = 1;
+      await db.kvPut('tt_kv_early', 'val');
+      expect(await db.kvGet('tt_kv_early', earlyTs)).toBeNull();
+    });
+
+    test('kvList with asOf returns fewer keys', async () => {
+      await db.kvPut('ttl_a', 1);
+      await sleep(50);
+      const range = await db.timeRange();
+      const ts = range.latestTs;
+      await sleep(50);
+      await db.kvPut('ttl_b', 2);
+
+      const current = await db.kvList('ttl_');
+      expect(current.length).toBe(2);
+      const past = await db.kvList('ttl_', ts);
+      expect(past.length).toBe(1);
+    });
+
+    test('stateGet with asOf returns past value', async () => {
+      await db.stateSet('tt_state', 'old');
+      await sleep(50);
+      const range = await db.timeRange();
+      const ts = range.latestTs;
+      await sleep(50);
+      await db.stateSet('tt_state', 'new');
+
+      expect(await db.stateGet('tt_state')).toBe('new');
+      expect(await db.stateGet('tt_state', ts)).toBe('old');
+    });
+
+    test('stateList with asOf', async () => {
+      await db.stateSet('tts_a', 1);
+      await sleep(50);
+      const range = await db.timeRange();
+      const ts = range.latestTs;
+      await sleep(50);
+      await db.stateSet('tts_b', 2);
+
+      const current = await db.stateList('tts_');
+      expect(current.length).toBe(2);
+      const past = await db.stateList('tts_', ts);
+      expect(past.length).toBe(1);
+    });
+
+    test('eventGet with asOf', async () => {
+      await db.eventAppend('tt_evt', { v: 1 });
+      // Event sequence is 0 (first event in fresh db)
+      const evt = await db.eventGet(0);
+      expect(evt).not.toBeNull();
+      expect(evt.value.v).toBe(1);
+      // The event timestamp is its creation time
+      const eventTs = evt.timestamp;
+
+      await sleep(50);
+      // asOf at the event timestamp should return it
+      const past = await db.eventGet(0, eventTs);
+      expect(past).not.toBeNull();
+
+      // asOf before the event was created should return null
+      const before = await db.eventGet(0, 1);
+      expect(before).toBeNull();
+    });
+
+    test('eventList with asOf', async () => {
+      await db.eventAppend('tt_etype', { n: 1 });
+      await sleep(50);
+      const range = await db.timeRange();
+      const ts = range.latestTs;
+      await sleep(50);
+      await db.eventAppend('tt_etype', { n: 2 });
+
+      const current = await db.eventList('tt_etype');
+      expect(current.length).toBe(2);
+      const past = await db.eventList('tt_etype', ts);
+      expect(past.length).toBe(1);
+    });
+
+    test('jsonGet with asOf returns past value', async () => {
+      await db.jsonSet('tt_json', '$', { v: 1 });
+      await sleep(50);
+      const range = await db.timeRange();
+      const ts = range.latestTs;
+      await sleep(50);
+      await db.jsonSet('tt_json', '$', { v: 2 });
+
+      const current = await db.jsonGet('tt_json', '$');
+      expect(current.v).toBe(2);
+      const past = await db.jsonGet('tt_json', '$', ts);
+      expect(past.v).toBe(1);
+    });
+
+    test('jsonList with asOf', async () => {
+      await db.jsonSet('ttj_a', '$', { x: 1 });
+      await sleep(50);
+      const range = await db.timeRange();
+      const ts = range.latestTs;
+      await sleep(50);
+      await db.jsonSet('ttj_b', '$', { x: 2 });
+
+      const current = await db.jsonList(100, 'ttj_');
+      expect(current.keys.length).toBe(2);
+      const past = await db.jsonList(100, 'ttj_', undefined, ts);
+      expect(past.keys.length).toBe(1);
+    });
+
+    test('vectorSearch with asOf', async () => {
+      await db.vectorCreateCollection('tt_vec', 4);
+      await db.vectorUpsert('tt_vec', 'a', [1, 0, 0, 0]);
+      await sleep(50);
+      const range = await db.timeRange();
+      const ts = range.latestTs;
+      await sleep(50);
+      await db.vectorUpsert('tt_vec', 'b', [0, 1, 0, 0]);
+
+      const current = await db.vectorSearch('tt_vec', [1, 0, 0, 0], 10);
+      expect(current.length).toBe(2);
+      const past = await db.vectorSearch('tt_vec', [1, 0, 0, 0], 10, ts);
+      expect(past.length).toBe(1);
+    });
+
+    test('vectorGet with asOf', async () => {
+      await db.vectorCreateCollection('tt_vget', 4);
+      await db.vectorUpsert('tt_vget', 'k', [1, 0, 0, 0], { tag: 'v1' });
+      await sleep(50);
+      const range = await db.timeRange();
+      const ts = range.latestTs;
+      await sleep(50);
+      await db.vectorUpsert('tt_vget', 'k', [0, 1, 0, 0], { tag: 'v2' });
+
+      const current = await db.vectorGet('tt_vget', 'k');
+      expect(current.metadata.tag).toBe('v2');
+      const past = await db.vectorGet('tt_vget', 'k', ts);
+      expect(past).not.toBeNull();
+      expect(past.metadata.tag).toBe('v1');
+    });
+
+    test('timeRange returns oldest and latest', async () => {
+      await db.kvPut('tr_key', 'val');
+      const range = await db.timeRange();
+      expect(range).toHaveProperty('oldestTs');
+      expect(range).toHaveProperty('latestTs');
+      expect(typeof range.oldestTs).toBe('number');
+      expect(typeof range.latestTs).toBe('number');
+      expect(range.latestTs).toBeGreaterThanOrEqual(range.oldestTs);
+    });
+  });
+
+  // =========================================================================
   // Errors
   // =========================================================================
 
