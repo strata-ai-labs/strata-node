@@ -1831,6 +1831,40 @@ impl Strata {
     }
 
     // =========================================================================
+    // Model Configuration
+    // =========================================================================
+
+    /// Configure an inference model endpoint for intelligent search.
+    ///
+    /// When a model is configured, `search()` transparently expands queries
+    /// using the model for better recall. Search works identically without a model.
+    #[napi(js_name = "configureModel")]
+    pub async fn configure_model(
+        &self,
+        endpoint: String,
+        model: String,
+        api_key: Option<String>,
+        timeout_ms: Option<u32>,
+    ) -> napi::Result<()> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_inner(&inner)?;
+            guard
+                .executor()
+                .execute(Command::ConfigureModel {
+                    endpoint,
+                    model,
+                    api_key,
+                    timeout_ms: timeout_ms.map(|ms| ms as u64),
+                })
+                .map_err(to_napi_err)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("{}", e)))?
+    }
+
+    // =========================================================================
     // Search
     // =========================================================================
 
