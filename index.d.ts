@@ -10,6 +10,28 @@ export interface JsOpenOptions {
   /** Open in read-only mode. */
   readOnly?: boolean
 }
+/** Time range filter for search (ISO 8601 datetime strings). */
+export interface JsTimeRange {
+  /** Range start (inclusive), e.g. "2026-02-07T00:00:00Z". */
+  start: string
+  /** Range end (inclusive), e.g. "2026-02-09T23:59:59Z". */
+  end: string
+}
+/** Options for cross-primitive search. */
+export interface JsSearchOptions {
+  /** Number of results to return (default: 10). */
+  k?: number
+  /** Restrict to specific primitives (e.g. ["kv", "json", "event"]). */
+  primitives?: Array<string>
+  /** Time range filter (ISO 8601 datetime strings). */
+  timeRange?: JsTimeRange
+  /** Search mode: "keyword" or "hybrid" (default: "hybrid"). */
+  mode?: string
+  /** Enable/disable query expansion. Absent = auto. */
+  expand?: boolean
+  /** Enable/disable reranking. Absent = auto. */
+  rerank?: boolean
+}
 /** Download model files for auto-embedding. */
 export declare function setup(): string
 /**
@@ -160,8 +182,15 @@ export declare class Strata {
   spaceCreate(space: string): Promise<void>
   /** Check if a space exists in the current branch. */
   spaceExists(space: string): Promise<boolean>
+  /**
+   * Configure an inference model endpoint for intelligent search.
+   *
+   * When a model is configured, `search()` transparently expands queries
+   * using the model for better recall. Search works identically without a model.
+   */
+  configureModel(endpoint: string, model: string, apiKey?: string | undefined | null, timeoutMs?: number | undefined | null): Promise<void>
   /** Search across multiple primitives for matching content. */
-  search(query: string, k?: number | undefined | null, primitives?: Array<string> | undefined | null): Promise<any>
+  search(query: string, options?: JsSearchOptions | undefined | null): Promise<any>
   /** Apply retention policy to trigger garbage collection. */
   retentionApply(): Promise<void>
   /**

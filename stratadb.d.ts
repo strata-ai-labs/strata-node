@@ -185,6 +185,30 @@ export interface SearchHit {
   snippet?: string;
 }
 
+/** Time range filter for search (ISO 8601 datetime strings) */
+export interface SearchTimeRange {
+  /** Range start (inclusive), e.g. "2026-02-07T00:00:00Z" */
+  start: string;
+  /** Range end (inclusive), e.g. "2026-02-09T23:59:59Z" */
+  end: string;
+}
+
+/** Options for cross-primitive search */
+export interface SearchOptions {
+  /** Number of results to return (default: 10). */
+  k?: number;
+  /** Restrict to specific primitives (e.g. ["kv", "json", "event"]). */
+  primitives?: string[];
+  /** Time range filter (ISO 8601 datetime strings). */
+  timeRange?: SearchTimeRange;
+  /** Search mode: "keyword" or "hybrid" (default: "hybrid"). */
+  mode?: string;
+  /** Enable/disable query expansion. Absent = auto (use if model configured). */
+  expand?: boolean;
+  /** Enable/disable reranking. Absent = auto (use if model configured). */
+  rerank?: boolean;
+}
+
 /** Time range for a branch */
 export interface TimeRange {
   oldestTs: number | null;
@@ -496,7 +520,7 @@ export class Strata {
   close(): Promise<void>;
 
   // Search
-  search(query: string, k?: number, primitives?: string[]): Promise<SearchHit[]>;
+  search(query: string, opts?: SearchOptions): Promise<SearchHit[]>;
 
   // Retention
   retentionApply(): Promise<void>;

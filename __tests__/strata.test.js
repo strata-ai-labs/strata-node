@@ -572,6 +572,47 @@ describe('Strata', () => {
       const results = await db.search('hello');
       expect(Array.isArray(results)).toBe(true);
     });
+
+    test('search empty database returns empty array', async () => {
+      const fresh = Strata.cache();
+      const results = await fresh.search('anything');
+      expect(results).toEqual([]);
+      await fresh.close();
+    });
+
+    test('search with primitives filter', async () => {
+      await db.kv.set('s_k', 'data');
+      const results = await db.search('data', { primitives: ['kv'] });
+      expect(Array.isArray(results)).toBe(true);
+    });
+
+    test('search with mode', async () => {
+      const results = await db.search('test', { mode: 'keyword' });
+      expect(Array.isArray(results)).toBe(true);
+    });
+
+    test('search with expand and rerank disabled', async () => {
+      const results = await db.search('test', { expand: false, rerank: false });
+      expect(Array.isArray(results)).toBe(true);
+    });
+
+    test('search with time range', async () => {
+      const results = await db.search('test', {
+        timeRange: { start: '2020-01-01T00:00:00Z', end: '2030-01-01T00:00:00Z' },
+      });
+      expect(Array.isArray(results)).toBe(true);
+    });
+
+    test('search with all options', async () => {
+      const results = await db.search('hello', {
+        k: 5,
+        primitives: ['kv'],
+        mode: 'hybrid',
+        expand: false,
+        rerank: false,
+      });
+      expect(Array.isArray(results)).toBe(true);
+    });
   });
 
   // =========================================================================

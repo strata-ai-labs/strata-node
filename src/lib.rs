@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use stratadb::{
     AccessMode, BatchVectorEntry, BranchExportResult, BranchId, BranchImportResult,
     BundleValidateResult, CollectionInfo, Command, DistanceMetric, Error as StrataError, FilterOp,
-    MergeStrategy, MetadataFilter, OpenOptions, Output, Session, Strata as RustStrata, TxnOptions,
-    Value, VersionedBranchInfo, VersionedValue,
+    MergeStrategy, MetadataFilter, OpenOptions, Output, SearchQuery, Session,
+    Strata as RustStrata, TimeRangeInput, TxnOptions, Value, VersionedBranchInfo, VersionedValue,
 };
 
 /// Maximum nesting depth for JSON → Value conversion.
@@ -27,6 +27,32 @@ pub struct JsOpenOptions {
     pub auto_embed: Option<bool>,
     /// Open in read-only mode.
     pub read_only: Option<bool>,
+}
+
+/// Time range filter for search (ISO 8601 datetime strings).
+#[napi(object)]
+pub struct JsTimeRange {
+    /// Range start (inclusive), e.g. "2026-02-07T00:00:00Z".
+    pub start: String,
+    /// Range end (inclusive), e.g. "2026-02-09T23:59:59Z".
+    pub end: String,
+}
+
+/// Options for cross-primitive search.
+#[napi(object)]
+pub struct JsSearchOptions {
+    /// Number of results to return (default: 10).
+    pub k: Option<u32>,
+    /// Restrict to specific primitives (e.g. ["kv", "json", "event"]).
+    pub primitives: Option<Vec<String>>,
+    /// Time range filter (ISO 8601 datetime strings).
+    pub time_range: Option<JsTimeRange>,
+    /// Search mode: "keyword" or "hybrid" (default: "hybrid").
+    pub mode: Option<String>,
+    /// Enable/disable query expansion. Absent = auto.
+    pub expand: Option<bool>,
+    /// Enable/disable reranking. Absent = auto.
+    pub rerank: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1873,20 +1899,43 @@ impl Strata {
     pub async fn search(
         &self,
         query: String,
-        k: Option<u32>,
-        primitives: Option<Vec<String>>,
+        options: Option<JsSearchOptions>,
     ) -> napi::Result<serde_json::Value> {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || {
             let guard = lock_inner(&inner)?;
+
+            let (k, primitives, time_range, mode, expand, rerank) = match options {
+                Some(opts) => (
+                    opts.k,
+                    opts.primitives,
+                    opts.time_range.map(|tr| TimeRangeInput {
+                        start: tr.start,
+                        end: tr.end,
+                    }),
+                    opts.mode,
+                    opts.expand,
+                    opts.rerank,
+                ),
+                None => (None, None, None, None, None, None),
+            };
+
+            let sq = SearchQuery {
+                query,
+                k: k.map(|n| n as u64),
+                primitives,
+                time_range,
+                mode,
+                expand,
+                rerank,
+            };
+
             match guard
                 .executor()
                 .execute(Command::Search {
                     branch: None,
                     space: None,
-                    query,
-                    k: k.map(|n| n as u64),
-                    primitives,
+                    search: sq,
                 })
                 .map_err(to_napi_err)?
             {
